@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <errno.h>
+#include <libavutil/samplefmt.h>
 #include "lib/internal.h"
 
 #define AUDIO_BUFFER_SIZE 4096
@@ -73,7 +74,7 @@ static void audio_callback(void* userdata, uint8_t* stream, int len) {
   pthread_mutex_unlock(&ao->mutex);
 
   // Fill remaining with silence if needed
-  if (bytes_to_write < len) {
+  if (bytes_to_write < (size_t)len) {
     memset(stream + bytes_to_write, 0, len - bytes_to_write);
   }
 }
