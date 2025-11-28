@@ -1,11 +1,12 @@
 #include "builddef.h"
 #ifdef USE_FFMPEG
+#include <libavutil/samplefmt.h>
+#include <libavcodec/avcodec.h>
 #include <SDL2/SDL.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <string.h>
 #include <errno.h>
-#include <libavutil/samplefmt.h>
 #include "lib/internal.h"
 
 #define AUDIO_BUFFER_SIZE 4096
