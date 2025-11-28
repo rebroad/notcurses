@@ -116,7 +116,10 @@ pkg_check_modules(AVDEVICE REQUIRED libavdevice>=57.0)
 pkg_check_modules(AVFORMAT REQUIRED libavformat>=57.0)
 pkg_check_modules(AVUTIL REQUIRED libavutil>=56.0)
 pkg_check_modules(SWSCALE REQUIRED libswscale>=5.0)
+pkg_check_modules(SWRESAMPLE REQUIRED libswresample>=4.0)
+pkg_check_modules(SDL2 REQUIRED sdl2>=2.0)
 set_property(GLOBAL APPEND PROPERTY PACKAGES_FOUND FFMpeg)
+set_property(GLOBAL APPEND PROPERTY PACKAGES_FOUND SDL2)
 elseif(${USE_OIIO})
 pkg_check_modules(OPENIMAGEIO REQUIRED OpenImageIO>=2.1)
 set_property(GLOBAL APPEND PROPERTY PACKAGES_FOUND OpenImageIO)
@@ -378,6 +381,8 @@ target_include_directories(notcurses
     "${AVFORMAT_INCLUDE_DIRS}"
     "${AVUTIL_INCLUDE_DIRS}"
     "${SWSCALE_INCLUDE_DIRS}"
+    "${SWRESAMPLE_INCLUDE_DIRS}"
+    "${SDL2_INCLUDE_DIRS}"
 )
 target_include_directories(notcurses-static
   PRIVATE
@@ -386,6 +391,8 @@ target_include_directories(notcurses-static
     "${AVFORMAT_STATIC_INCLUDE_DIRS}"
     "${AVUTIL_STATIC_INCLUDE_DIRS}"
     "${SWSCALE_STATIC_INCLUDE_DIRS}"
+    "${SWRESAMPLE_STATIC_INCLUDE_DIRS}"
+    "${SDL2_INCLUDE_DIRS}"
 )
 target_link_libraries(notcurses
   PRIVATE
@@ -394,6 +401,8 @@ target_link_libraries(notcurses
     "${AVFORMAT_LIBRARIES}"
     "${SWSCALE_LIBRARIES}"
     "${AVUTIL_LIBRARIES}"
+    "${SWRESAMPLE_LIBRARIES}"
+    "${SDL2_LIBRARIES}"
 )
 target_link_libraries(notcurses-static
   PRIVATE
@@ -402,6 +411,8 @@ target_link_libraries(notcurses-static
     "${AVFORMAT_STATIC_LIBRARIES}"
     "${SWSCALE_STATIC_LIBRARIES}"
     "${AVUTIL_STATIC_LIBRARIES}"
+    "${SWRESAMPLE_STATIC_LIBRARIES}"
+    "${SDL2_LIBRARIES}"
 )
 target_link_directories(notcurses
   PRIVATE
@@ -410,6 +421,8 @@ target_link_directories(notcurses
     "${AVFORMAT_LIBRARY_DIRS}"
     "${SWSCALE_LIBRARY_DIRS}"
     "${AVUTIL_LIBRARY_DIRS}"
+    "${SWRESAMPLE_LIBRARY_DIRS}"
+    "${SDL2_LIBRARY_DIRS}"
 )
 target_link_directories(notcurses-static
   PRIVATE
@@ -417,6 +430,8 @@ target_link_directories(notcurses-static
     "${AVDEVICE_STATIC_LIBRARY_DIRS}"
     "${AVFORMAT_STATIC_LIBRARY_DIRS}"
     "${SWSCALE_STATIC_LIBRARY_DIRS}"
+    "${SWRESAMPLE_STATIC_LIBRARY_DIRS}"
+    "${SDL2_LIBRARY_DIRS}"
     "${AVUTIL_STATIC_LIBRARY_DIRS}"
 )
 elseif(${USE_OIIO})
