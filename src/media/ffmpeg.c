@@ -47,6 +47,7 @@ typedef struct ncvisual_details {
   int audio_stream_index;  // audio stream index, can be < 0 if no audio
   bool packet_outstanding;
   bool audio_packet_outstanding;
+  pthread_mutex_t packet_mutex; // protects packet reading from format context
 } ncvisual_details;
 
 #define IMGALLOCALIGN 64
@@ -333,7 +334,10 @@ ffmpeg_decode(ncvisual* n){
           av_packet_unref(n->details->packet);
         }
         int averr;
-        if((averr = av_read_frame(n->details->fmtctx, n->details->packet)) < 0){
+        pthread_mutex_lock(&n->details->packet_mutex);
+        averr = av_read_frame(n->details->fmtctx, n->details->packet);
+        pthread_mutex_unlock(&n->details->packet_mutex);
+        if(averr < 0){
           /*if(averr != AVERROR_EOF){
             fprintf(stderr, "Error reading frame info (%s)\n", av_err2str(averr));
           }*/
@@ -390,12 +394,18 @@ ffmpeg_details_init(void){
     deets->stream_index = -1;
     deets->sub_stream_index = -1;
     deets->audio_stream_index = -1;
+    if(pthread_mutex_init(&deets->packet_mutex, NULL) != 0){
+      free(deets);
+      return NULL;
+    }
     if((deets->frame = av_frame_alloc()) == NULL){
+      pthread_mutex_destroy(&deets->packet_mutex);
       free(deets);
       return NULL;
     }
     if((deets->audio_frame = av_frame_alloc()) == NULL){
       av_frame_free(&deets->frame);
+      pthread_mutex_destroy(&deets->packet_mutex);
       free(deets);
       return NULL;
     }
@@ -715,10 +725,24 @@ static int
 ffmpeg_decode_loop(ncvisual* ncv){
   int r = ffmpeg_decode(ncv);
   if(r == 1){
-    if(av_seek_frame(ncv->details->fmtctx, ncv->details->stream_index, 0, AVSEEK_FLAG_FRAME) < 0){
+    // Seek all streams (video and audio) back to start
+    pthread_mutex_lock(&ncv->details->packet_mutex);
+    if(av_seek_frame(ncv->details->fmtctx, -1, 0, AVSEEK_FLAG_BACKWARD) < 0){
+      pthread_mutex_unlock(&ncv->details->packet_mutex);
       // FIXME log error
       return -1;
     }
+    // Flush codecs
+    avcodec_flush_buffers(ncv->details->codecctx);
+    if(ncv->details->audiocodecctx){
+      avcodec_flush_buffers(ncv->details->audiocodecctx);
+    }
+    if(ncv->details->subtcodecctx){
+      avcodec_flush_buffers(ncv->details->subtcodecctx);
+    }
+    ncv->details->packet_outstanding = false;
+    ncv->details->audio_packet_outstanding = false;
+    pthread_mutex_unlock(&ncv->details->packet_mutex);
     if(ffmpeg_decode(ncv) < 0){
       return -1;
     }
@@ -883,6 +907,7 @@ ffmpeg_details_destroy(ncvisual_details* deets){
   av_packet_free(&deets->packet);
   avformat_close_input(&deets->fmtctx);
   avsubtitle_free(&deets->subtitle);
+  pthread_mutex_destroy(&deets->packet_mutex);
   free(deets);
 }
 
@@ -941,6 +966,81 @@ int ffmpeg_decode_audio_public(ncvisual* ncv, AVPacket* packet){
 int ffmpeg_resample_audio_public(ncvisual* ncv, uint8_t** out_data, int* out_linesize,
                                   int out_samples, int out_sample_rate, int out_channels){
   return ffmpeg_resample_audio(ncv, out_data, out_linesize, out_samples, out_sample_rate, out_channels);
+}
+
+// Get the current decoded audio frame (after calling ffmpeg_decode_audio_public)
+AVFrame* ffmpeg_get_audio_frame(ncvisual* ncv){
+  if(!ncv || !ncv->details){
+    return NULL;
+  }
+  return ncv->details->audio_frame;
+}
+
+// Read next audio packet from the file (thread-safe)
+// Returns: 0 = success, <0 = error, 1 = EOF
+// Caller must free the packet with av_packet_free()
+int ffmpeg_read_audio_packet(ncvisual* ncv, AVPacket** pkt){
+  if(!ncv || !ncv->details || ncv->details->audio_stream_index < 0 || !ncv->details->fmtctx){
+    return -1;
+  }
+
+  *pkt = av_packet_alloc();
+  if(!*pkt){
+    return -1;
+  }
+
+  pthread_mutex_lock(&ncv->details->packet_mutex);
+  int averr;
+  do{
+    averr = av_read_frame(ncv->details->fmtctx, *pkt);
+    if(averr < 0){
+      pthread_mutex_unlock(&ncv->details->packet_mutex);
+      av_packet_free(pkt);
+      if(averr == AVERROR_EOF){
+        return 1;
+      }
+      return averr2ncerr(averr);
+    }
+    // Skip non-audio packets
+    if((*pkt)->stream_index != ncv->details->audio_stream_index){
+      av_packet_unref(*pkt);
+      continue;
+    }
+    // Found audio packet
+    break;
+  }while(1);
+  pthread_mutex_unlock(&ncv->details->packet_mutex);
+  return 0;
+}
+
+// Seek both video and audio streams to beginning (for looping)
+int ffmpeg_seek_to_start(ncvisual* ncv){
+  if(!ncv || !ncv->details || !ncv->details->fmtctx){
+    return -1;
+  }
+  
+  pthread_mutex_lock(&ncv->details->packet_mutex);
+  
+  int ret = av_seek_frame(ncv->details->fmtctx, -1, 0, AVSEEK_FLAG_BACKWARD);
+  
+  if(ret >= 0){
+    // Flush codecs
+    if(ncv->details->codecctx){
+      avcodec_flush_buffers(ncv->details->codecctx);
+    }
+    if(ncv->details->audiocodecctx){
+      avcodec_flush_buffers(ncv->details->audiocodecctx);
+    }
+    if(ncv->details->subtcodecctx){
+      avcodec_flush_buffers(ncv->details->subtcodecctx);
+    }
+    
+    ncv->details->packet_outstanding = false;
+    ncv->details->audio_packet_outstanding = false;
+  }
+  
+  pthread_mutex_unlock(&ncv->details->packet_mutex);
+  return ret;
 }
 
 ncvisual_implementation local_visual_implementation = {

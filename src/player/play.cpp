@@ -10,6 +10,17 @@
 #include <unistd.h>
 #include <iostream>
 #include <inttypes.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/packet.h>
+#include "builddef.h"
+#ifdef USE_FFMPEG
+#include "media/ffmpeg-audio.h"
+#include "media/audio-output.h"
+#endif
 #include <ncpp/Direct.hh>
 #include <ncpp/Visual.hh>
 #include <ncpp/NotCurses.hh>
@@ -42,7 +53,158 @@ struct marshal {
   int framecount;
   bool quiet;
   ncblitter_e blitter; // can be changed while streaming, must propagate out
+#ifdef USE_FFMPEG
+  audio_output* ao;    // audio output handle
+  std::atomic<bool>* audio_running; // flag to control audio thread
+  std::mutex* audio_mutex;
+  audio_thread_data* audio_data; // audio thread data for pause/resume
+#endif
 };
+
+#ifdef USE_FFMPEG
+struct audio_thread_data {
+  ncvisual* ncv;
+  audio_output* ao;
+  std::atomic<bool>* running;
+  std::mutex* mutex;
+  double timescale;
+  bool paused;
+  bool loop;  // whether we should loop on EOF
+};
+
+// Audio thread function - continuously decodes and plays audio
+static void audio_thread_func(audio_thread_data* data) {
+  ncvisual* ncv = data->ncv;
+  audio_output* ao = data->ao;
+  
+  if(!ffmpeg_has_audio(ncv) || !ao){
+    return;
+  }
+
+  AVCodecContext* acodecctx = ffmpeg_get_audio_codec_context(ncv);
+  if(!acodecctx){
+    return;
+  }
+
+  int sample_rate = acodecctx->sample_rate;
+  int channels = 0;
+  if(acodecctx->ch_layout.nb_channels > 0){
+    channels = acodecctx->ch_layout.nb_channels;
+  }else{
+    channels = acodecctx->channels;
+  }
+
+  // Initialize resampler for output format (S16, 44100 Hz, stereo/mono)
+  int out_sample_rate = 44100;
+  int out_channels = channels > 1 ? 2 : 1;
+  if(ffmpeg_init_audio_resampler_public(ncv, out_sample_rate, out_channels) < 0){
+    return;
+  }
+
+  double audio_time_base = ffmpeg_get_audio_time_base(ncv);
+  AVPacket* packet = nullptr;
+
+  while(*data->running){
+    // Handle pause state
+    if(data->paused){
+      usleep(50000); // 50ms
+      continue;
+    }
+
+    // Read audio packet if we don't have one
+    if(!packet){
+      int ret = ffmpeg_read_audio_packet(ncv, &packet);
+      if(ret < 0){
+        break; // error
+      }
+      if(ret == 1){
+        // EOF
+        av_packet_free(&packet);
+        packet = nullptr;
+        
+        if(data->loop){
+          // Flush audio buffers and seek to start
+          audio_output_flush(ao);
+          ffmpeg_seek_to_start(ncv);
+          // Continue reading from the beginning
+          continue;
+        }else{
+          // Not looping - wait a bit then exit
+          usleep(100000); // 100ms
+          break;
+        }
+      }
+    }
+
+    // Process all frames from current packet
+    bool packet_fully_processed = false;
+    while(!packet_fully_processed && *data->running){
+      // Decode audio - pass packet on first call, nullptr on subsequent calls
+      int decode_ret = ffmpeg_decode_audio_public(ncv, packet);
+      
+      if(decode_ret < 0){
+        // Error - discard packet and break
+        if(packet){
+          av_packet_free(&packet);
+          packet = nullptr;
+        }
+        break;
+      }
+      
+      if(decode_ret == 0){
+        // Need more input - we've consumed all frames from this packet
+        if(packet){
+          av_packet_free(&packet);
+          packet = nullptr;
+        }
+        packet_fully_processed = true;
+        continue;
+      }
+
+      // Got samples decoded (>0) - process the frame
+      AVFrame* frame = ffmpeg_get_audio_frame(ncv);
+      if(!frame || frame->nb_samples <= 0){
+        // No frame data, but decode returned >0 - continue to next frame
+        continue;
+      }
+
+      // Resample to output format
+      uint8_t* out_data = nullptr;
+      int out_linesize = 0;
+      int out_samples = ffmpeg_resample_audio_public(ncv, &out_data, &out_linesize,
+                                                      frame->nb_samples, out_sample_rate, out_channels);
+      
+      if(out_samples > 0 && out_data){
+        // Write to audio output
+        if(audio_output_write(ao, out_data, out_linesize) < 0){
+          av_freep(&out_data);
+          break; // error writing
+        }
+        
+        // Update audio clock with PTS
+        if(frame->pts != AV_NOPTS_VALUE){
+          uint64_t pts = frame->pts;
+          audio_output_set_pts(ao, pts, audio_time_base);
+        }
+
+        av_freep(&out_data);
+      }
+      
+      // After first successful decode with packet, don't pass packet again
+      // (we'll pass nullptr to get more frames from the same packet)
+      if(packet){
+        av_packet_free(&packet);
+        packet = nullptr;
+      }
+    }
+  }
+  
+  // Cleanup
+  if(packet){
+    av_packet_free(&packet);
+  }
+}
+#endif // USE_FFMPEG
 
 // frame count is in the curry. original time is kept in n's userptr.
 auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
@@ -114,6 +276,19 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       continue;
     }
     if(keyp == ' '){
+      // Pause/resume audio
+#ifdef USE_FFMPEG
+      if(marsh->ao && marsh->audio_data){
+        std::lock_guard<std::mutex> lock(*marsh->audio_mutex);
+        if(marsh->audio_data->paused){
+          marsh->audio_data->paused = false;
+          audio_output_resume(marsh->ao);
+        }else{
+          marsh->audio_data->paused = true;
+          audio_output_pause(marsh->ao);
+        }
+      }
+#endif
       do{
         if((keyp = nc.get(true, &ni)) == (uint32_t)-1){
           ncplane_destroy(subp);
@@ -359,11 +534,62 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       ncplane_scrollup_child(*stdn, clin);
     }
     ncplane_erase(n);
+    
+    // Initialize audio if available
+#ifdef USE_FFMPEG
+    audio_output* ao = nullptr;
+    std::thread* audio_thread = nullptr;
+    std::atomic<bool> audio_running(false);
+    std::mutex audio_mutex;
+    audio_thread_data* audio_data = nullptr;
+    
+    ncvisual* raw_ncv = *ncv; // Get underlying ncvisual*
+    if(ffmpeg_has_audio(raw_ncv)){
+      AVCodecContext* acodecctx = ffmpeg_get_audio_codec_context(raw_ncv);
+      if(acodecctx){
+        int sample_rate = acodecctx->sample_rate;
+        int channels = 0;
+        if(acodecctx->ch_layout.nb_channels > 0){
+          channels = acodecctx->ch_layout.nb_channels;
+        }else{
+          channels = acodecctx->channels;
+        }
+        
+        ao = audio_output_init(sample_rate, channels > 1 ? 2 : 1, acodecctx->sample_fmt);
+        if(ao){
+          audio_running = true;
+          
+          // Create audio thread data
+          audio_data = new audio_thread_data();
+          audio_data->ncv = raw_ncv;
+          audio_data->ao = ao;
+          audio_data->running = &audio_running;
+          audio_data->mutex = &audio_mutex;
+          audio_data->timescale = timescale;
+          audio_data->paused = false;
+          audio_data->loop = loop;
+          
+          // Start audio thread
+          audio_thread = new std::thread(audio_thread_func, audio_data);
+          
+          // Start audio playback
+          audio_output_start(ao);
+        }
+      }
+    }
+#endif
+    
     do{
       struct marshal marsh = {
         .framecount = 0,
         .quiet = quiet,
         .blitter = vopts.blitter,
+#ifdef USE_FFMPEG
+        .ao = ao,
+        .audio_running = &audio_running,
+        .audio_mutex = &audio_mutex,
+        .audio_data = audio_data,
+#endif
       };
       r = ncv->stream(&vopts, timescale, perframe, &marsh);
       free(stdn->get_userptr());
@@ -410,11 +636,45 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
             clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
           }
         }else{
+          // Loop - flush audio buffers if present
+#ifdef USE_FFMPEG
+          if(ao){
+            audio_output_flush(ao);
+          }
+          // Seek both video and audio streams
+          ncvisual* raw_ncv = *ncv;
+          if(ffmpeg_has_audio(raw_ncv)){
+            ffmpeg_seek_to_start(raw_ncv);
+          }
+#endif
           ncv->decode_loop();
         }
         ncplane_destroy(clin);
       }
     }while(loop && r == 0);
+    
+#ifdef USE_FFMPEG
+    // Stop audio thread
+    if(audio_running.load()){
+      audio_running = false;
+      if(audio_thread && audio_thread->joinable()){
+        audio_thread->join();
+      }
+      if(audio_thread){
+        delete audio_thread;
+        audio_thread = nullptr;
+      }
+      if(audio_data){
+        delete audio_data;
+        audio_data = nullptr;
+      }
+      if(ao){
+        audio_output_destroy(ao);
+        ao = nullptr;
+      }
+    }
+#endif
+    
     if(r < 0){ // positive is intentional abort
       std::cerr << "Error while playing " << argv[i] << std::endl;
       goto err;
@@ -425,6 +685,24 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
   return 0;
 
 err:
+#ifdef USE_FFMPEG
+  // Cleanup audio on error
+  if(audio_running.load()){
+    audio_running = false;
+    if(audio_thread && audio_thread->joinable()){
+      audio_thread->join();
+    }
+    if(audio_thread){
+      delete audio_thread;
+    }
+    if(audio_data){
+      delete audio_data;
+    }
+    if(ao){
+      audio_output_destroy(ao);
+    }
+  }
+#endif
   free(ncplane_userptr(n));
   ncplane_destroy(n);
   return -1;

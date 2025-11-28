@@ -37,7 +37,16 @@ int ffmpeg_decode_audio_public(ncvisual* ncv, AVPacket* packet);
 
 // Resample audio frame (public wrapper)
 int ffmpeg_resample_audio_public(ncvisual* ncv, uint8_t** out_data, int* out_linesize,
-								  int out_samples, int out_sample_rate, int out_channels);
+                                  int out_samples, int out_sample_rate, int out_channels);
+
+// Read next audio packet from file (thread-safe, caller must free packet)
+int ffmpeg_read_audio_packet(ncvisual* ncv, AVPacket** pkt);
+
+// Get the current decoded audio frame
+AVFrame* ffmpeg_get_audio_frame(ncvisual* ncv);
+
+// Seek both video and audio streams to beginning (for looping)
+int ffmpeg_seek_to_start(ncvisual* ncv);
 
 #ifdef __cplusplus
 }

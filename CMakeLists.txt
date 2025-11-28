@@ -866,6 +866,21 @@ target_include_directories(ncplayer
     "${CMAKE_REQUIRED_INCLUDES}"
     "${PROJECT_BINARY_DIR}/include"
 )
+if(${USE_FFMPEG})
+target_include_directories(ncplayer
+  PRIVATE
+    "${AVCODEC_INCLUDE_DIRS}"
+    "${AVFORMAT_INCLUDE_DIRS}"
+    "${AVUTIL_INCLUDE_DIRS}"
+    "${SWRESAMPLE_INCLUDE_DIRS}"
+    "${SDL2_INCLUDE_DIRS}"
+)
+target_link_libraries(ncplayer
+  PRIVATE
+    "${SWRESAMPLE_LIBRARIES}"
+    "${SDL2_LIBRARIES}"
+)
+endif()
 target_link_libraries(ncplayer
   PRIVATE
     notcurses++
