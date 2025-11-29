@@ -648,11 +648,14 @@ ffmpeg_init_audio_resampler_internal(ncvisual* ncv, int out_sample_rate, int out
 
   out_channel_mask = (out_channels == 1) ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
 
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   ncv->details->swrctx = swr_alloc_set_opts(
     NULL,
     out_channel_mask, AV_SAMPLE_FMT_S16, out_sample_rate,
     in_channel_mask, acodecctx->sample_fmt, acodecctx->sample_rate,
     0, NULL);
+  #pragma GCC diagnostic pop
 
   if(!ncv->details->swrctx){
     return -1;
