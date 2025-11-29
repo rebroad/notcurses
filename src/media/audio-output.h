@@ -4,9 +4,14 @@
 #include "builddef.h"
 #ifdef USE_FFMPEG
 
-#include <libavutil/samplefmt.h>
 #include <stdint.h>
 #include <stddef.h>
+// Define API macro for visibility export
+#ifndef __MINGW32__
+#define API __attribute__((visibility("default")))
+#else
+#define API __declspec(dllexport)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,16 +19,17 @@ extern "C" {
 
 typedef struct audio_output audio_output;
 
-audio_output* audio_output_init(int sample_rate, int channels, AVSampleFormat sample_fmt);
-void audio_output_start(audio_output* ao);
-void audio_output_pause(audio_output* ao);
-void audio_output_resume(audio_output* ao);
-int audio_output_write(audio_output* ao, const uint8_t* data, size_t len);
-double audio_output_get_clock(audio_output* ao);
-void audio_output_set_pts(audio_output* ao, uint64_t pts, double time_base);
-void audio_output_flush(audio_output* ao);
-void audio_output_destroy(audio_output* ao);
-audio_output* audio_output_get_global(void);
+// sample_fmt is AVSampleFormat from libavutil, but we use int to avoid include issues
+API audio_output* audio_output_init(int sample_rate, int channels, int sample_fmt);
+API void audio_output_start(audio_output* ao);
+API void audio_output_pause(audio_output* ao);
+API void audio_output_resume(audio_output* ao);
+API int audio_output_write(audio_output* ao, const uint8_t* data, size_t len);
+API double audio_output_get_clock(audio_output* ao);
+API void audio_output_set_pts(audio_output* ao, uint64_t pts, double time_base);
+API void audio_output_flush(audio_output* ao);
+API void audio_output_destroy(audio_output* ao);
+API audio_output* audio_output_get_global(void);
 
 #ifdef __cplusplus
 }

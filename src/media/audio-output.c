@@ -1,13 +1,22 @@
 #include "builddef.h"
 #ifdef USE_FFMPEG
-#include <libavutil/samplefmt.h>
+// Include FFmpeg headers the same way ffmpeg.c does
+#include <libavutil/error.h>
+#include <libavutil/frame.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/samplefmt.h>
 #include <SDL2/SDL.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <string.h>
 #include <errno.h>
 #include "lib/internal.h"
+// Define API macro for visibility export
+#ifndef __MINGW32__
+#define API __attribute__((visibility("default")))
+#else
+#define API __declspec(dllexport)
+#endif
 
 #define AUDIO_BUFFER_SIZE 4096
 
@@ -27,7 +36,7 @@ typedef struct audio_output {
   uint64_t audio_pts;  // Audio PTS in timebase units
   int sample_rate;
   int channels;
-  AVSampleFormat sample_fmt;
+  int sample_fmt;  // AVSampleFormat (using int to avoid include issues)
 } audio_output;
 
 static audio_output* g_audio = NULL;
@@ -80,7 +89,7 @@ static void audio_callback(void* userdata, uint8_t* stream, int len) {
   }
 }
 
-audio_output* audio_output_init(int sample_rate, int channels, AVSampleFormat sample_fmt) {
+API audio_output* audio_output_init(int sample_rate, int channels, int sample_fmt) {
   if (SDL_Init(SDL_INIT_AUDIO) < 0) {
     logerror("SDL audio init failed: %s", SDL_GetError());
     return NULL;
@@ -149,26 +158,26 @@ audio_output* audio_output_init(int sample_rate, int channels, AVSampleFormat sa
   return ao;
 }
 
-void audio_output_start(audio_output* ao) {
+API void audio_output_start(audio_output* ao) {
   if (!ao) return;
   ao->playing = true;
   ao->paused = false;
   SDL_PauseAudioDevice(ao->device_id, 0);
 }
 
-void audio_output_pause(audio_output* ao) {
+API void audio_output_pause(audio_output* ao) {
   if (!ao) return;
   ao->paused = true;
   SDL_PauseAudioDevice(ao->device_id, 1);
 }
 
-void audio_output_resume(audio_output* ao) {
+API void audio_output_resume(audio_output* ao) {
   if (!ao) return;
   ao->paused = false;
   SDL_PauseAudioDevice(ao->device_id, 0);
 }
 
-int audio_output_write(audio_output* ao, const uint8_t* data, size_t len) {
+API int audio_output_write(audio_output* ao, const uint8_t* data, size_t len) {
   if (!ao || !data) return -1;
 
   pthread_mutex_lock(&ao->mutex);
@@ -189,7 +198,7 @@ int audio_output_write(audio_output* ao, const uint8_t* data, size_t len) {
   return 0;
 }
 
-double audio_output_get_clock(audio_output* ao) {
+API double audio_output_get_clock(audio_output* ao) {
   if (!ao) return 0.0;
   pthread_mutex_lock(&ao->mutex);
   double clock = ao->audio_clock;
@@ -197,7 +206,7 @@ double audio_output_get_clock(audio_output* ao) {
   return clock;
 }
 
-void audio_output_set_pts(audio_output* ao, uint64_t pts, double time_base) {
+API void audio_output_set_pts(audio_output* ao, uint64_t pts, double time_base) {
   if (!ao) return;
   pthread_mutex_lock(&ao->mutex);
   ao->audio_pts = pts;
@@ -205,7 +214,7 @@ void audio_output_set_pts(audio_output* ao, uint64_t pts, double time_base) {
   pthread_mutex_unlock(&ao->mutex);
 }
 
-void audio_output_flush(audio_output* ao) {
+API void audio_output_flush(audio_output* ao) {
   if (!ao) return;
   pthread_mutex_lock(&ao->mutex);
   ao->buffer_pos = 0;
@@ -214,7 +223,7 @@ void audio_output_flush(audio_output* ao) {
   pthread_mutex_unlock(&ao->mutex);
 }
 
-void audio_output_destroy(audio_output* ao) {
+API void audio_output_destroy(audio_output* ao) {
   if (!ao) return;
 
   ao->playing = false;
@@ -233,7 +242,7 @@ void audio_output_destroy(audio_output* ao) {
   SDL_QuitSubSystem(SDL_INIT_AUDIO);
 }
 
-audio_output* audio_output_get_global(void) {
+API audio_output* audio_output_get_global(void) {
   return g_audio;
 }
 

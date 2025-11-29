@@ -877,6 +877,9 @@ target_include_directories(ncplayer
 )
 target_link_libraries(ncplayer
   PRIVATE
+    "${AVCODEC_LIBRARIES}"
+    "${AVFORMAT_LIBRARIES}"
+    "${AVUTIL_LIBRARIES}"
     "${SWRESAMPLE_LIBRARIES}"
     "${SDL2_LIBRARIES}"
 )
@@ -884,6 +887,12 @@ endif()
 target_link_libraries(ncplayer
   PRIVATE
     notcurses++
+    notcurses
+)
+# Set RPATH so ncplayer can find libraries in build directory
+set_target_properties(ncplayer PROPERTIES
+  BUILD_RPATH "${CMAKE_BINARY_DIR}"
+  INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}"
 )
 endif()
 endif()

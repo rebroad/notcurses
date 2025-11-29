@@ -16,8 +16,15 @@
 #include <libavformat/avformat.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/mem.h>
 #include "lib/visual-details.h"
 #include "lib/internal.h"
+// Define API macro for visibility export
+#ifndef __MINGW32__
+#define API __attribute__((visibility("default")))
+#else
+#define API __declspec(dllexport)
+#endif
 #include "ffmpeg-audio.h"
 
 struct AVFormatContext;
@@ -572,8 +579,15 @@ ffmpeg_init_audio_resampler(ncvisual* ncv, int out_sample_rate, int out_channels
   }
 
   AVCodecContext* acodecctx = ncv->details->audiocodecctx;
-  AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+  AVChannelLayout out_ch_layout;
   AVChannelLayout in_ch_layout;
+
+  // Initialize output channel layout
+  if(out_channels == 1){
+    av_channel_layout_default(&out_ch_layout, 1);
+  }else{
+    av_channel_layout_default(&out_ch_layout, 2);
+  }
 
   // Get input channel layout
   if(acodecctx->ch_layout.nb_channels == 0){
@@ -581,10 +595,6 @@ ffmpeg_init_audio_resampler(ncvisual* ncv, int out_sample_rate, int out_channels
     av_channel_layout_default(&in_ch_layout, acodecctx->channels);
   }else{
     in_ch_layout = acodecctx->ch_layout;
-  }
-
-  if(out_channels == 1){
-    out_ch_layout = AV_CHANNEL_LAYOUT_MONO;
   }
 
   ncv->details->swrctx = swr_alloc_set_opts2(
@@ -923,7 +933,7 @@ ffmpeg_destroy(ncvisual* ncv){
 }
 
 // Public wrapper functions for audio access from play.cpp
-bool ffmpeg_has_audio(ncvisual* ncv){
+API bool ffmpeg_has_audio(ncvisual* ncv){
   if(!ncv || !ncv->details){
     return false;
   }
@@ -969,7 +979,7 @@ int ffmpeg_resample_audio_public(ncvisual* ncv, uint8_t** out_data, int* out_lin
 }
 
 // Get the current decoded audio frame (after calling ffmpeg_decode_audio_public)
-AVFrame* ffmpeg_get_audio_frame(ncvisual* ncv){
+API AVFrame* ffmpeg_get_audio_frame(ncvisual* ncv){
   if(!ncv || !ncv->details){
     return NULL;
   }
@@ -1014,15 +1024,15 @@ int ffmpeg_read_audio_packet(ncvisual* ncv, AVPacket** pkt){
 }
 
 // Seek both video and audio streams to beginning (for looping)
-int ffmpeg_seek_to_start(ncvisual* ncv){
+API int ffmpeg_seek_to_start(ncvisual* ncv){
   if(!ncv || !ncv->details || !ncv->details->fmtctx){
     return -1;
   }
-  
+
   pthread_mutex_lock(&ncv->details->packet_mutex);
-  
+
   int ret = av_seek_frame(ncv->details->fmtctx, -1, 0, AVSEEK_FLAG_BACKWARD);
-  
+
   if(ret >= 0){
     // Flush codecs
     if(ncv->details->codecctx){
@@ -1034,11 +1044,11 @@ int ffmpeg_seek_to_start(ncvisual* ncv){
     if(ncv->details->subtcodecctx){
       avcodec_flush_buffers(ncv->details->subtcodecctx);
     }
-    
+
     ncv->details->packet_outstanding = false;
     ncv->details->audio_packet_outstanding = false;
   }
-  
+
   pthread_mutex_unlock(&ncv->details->packet_mutex);
   return ret;
 }

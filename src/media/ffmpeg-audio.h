@@ -4,10 +4,24 @@
 #include "builddef.h"
 #ifdef USE_FFMPEG
 
+// FFmpeg headers need extern "C" when included from C++
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#ifdef __cplusplus
+}
+#endif
+
 #include <stdbool.h>
 #include "lib/visual-details.h"
+// Define API macro for visibility export
+#ifndef __MINGW32__
+#define API __attribute__((visibility("default")))
+#else
+#define API __declspec(dllexport)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,35 +32,35 @@ extern "C" {
 // without directly accessing the internal structure
 
 // Check if an ncvisual has an audio stream
-bool ffmpeg_has_audio(ncvisual* ncv);
+API bool ffmpeg_has_audio(ncvisual* ncv);
 
 // Get audio codec context (returns NULL if no audio)
-AVCodecContext* ffmpeg_get_audio_codec_context(ncvisual* ncv);
+API AVCodecContext* ffmpeg_get_audio_codec_context(ncvisual* ncv);
 
 // Get audio stream index (returns -1 if no audio)
-int ffmpeg_get_audio_stream_index(ncvisual* ncv);
+API int ffmpeg_get_audio_stream_index(ncvisual* ncv);
 
 // Get audio stream time_base
-double ffmpeg_get_audio_time_base(ncvisual* ncv);
+API double ffmpeg_get_audio_time_base(ncvisual* ncv);
 
 // Initialize audio resampler for output format
-int ffmpeg_init_audio_resampler_public(ncvisual* ncv, int out_sample_rate, int out_channels);
+API int ffmpeg_init_audio_resampler_public(ncvisual* ncv, int out_sample_rate, int out_channels);
 
 // Decode audio packet (public wrapper)
-int ffmpeg_decode_audio_public(ncvisual* ncv, AVPacket* packet);
+API int ffmpeg_decode_audio_public(ncvisual* ncv, AVPacket* packet);
 
 // Resample audio frame (public wrapper)
-int ffmpeg_resample_audio_public(ncvisual* ncv, uint8_t** out_data, int* out_linesize,
-                                  int out_samples, int out_sample_rate, int out_channels);
+API int ffmpeg_resample_audio_public(ncvisual* ncv, uint8_t** out_data, int* out_linesize,
+								  int out_samples, int out_sample_rate, int out_channels);
 
 // Read next audio packet from file (thread-safe, caller must free packet)
-int ffmpeg_read_audio_packet(ncvisual* ncv, AVPacket** pkt);
+API int ffmpeg_read_audio_packet(ncvisual* ncv, AVPacket** pkt);
 
 // Get the current decoded audio frame
-AVFrame* ffmpeg_get_audio_frame(ncvisual* ncv);
+API AVFrame* ffmpeg_get_audio_frame(ncvisual* ncv);
 
 // Seek both video and audio streams to beginning (for looping)
-int ffmpeg_seek_to_start(ncvisual* ncv);
+API int ffmpeg_seek_to_start(ncvisual* ncv);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,10 @@
 #include "internal.h"
 
-ncloglevel_e loglevel = NCLOGLEVEL_SILENT;
+#ifndef __MINGW32__
+__attribute__((visibility("default"))) ncloglevel_e loglevel = NCLOGLEVEL_SILENT;
+#else
+__declspec(dllexport) ncloglevel_e loglevel = NCLOGLEVEL_SILENT;
+#endif
 
 void notcurses_debug(const notcurses* nc, FILE* debugfp){
   fbuf f;
