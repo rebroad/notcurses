@@ -106,8 +106,7 @@ static void audio_callback(void* userdata, uint8_t* stream, int len) {
   pthread_mutex_lock(&ao->mutex);
 
   size_t bytes_to_write = len;
-  // Calculate available bytes: buffer_used is total bytes written, buffer_pos is bytes consumed
-  size_t bytes_available = ao->buffer_used - ao->buffer_pos;
+  size_t bytes_available = ao->buffer_used;
 
   if (bytes_available == 0) {
     // Buffer underrun - fill with silence
@@ -122,16 +121,13 @@ static void audio_callback(void* userdata, uint8_t* stream, int len) {
 
   memcpy(stream, ao->buffer + ao->buffer_pos, bytes_to_write);
   ao->buffer_pos += bytes_to_write;
+  ao->buffer_used -= bytes_to_write;
 
-  // Compact buffer if we've consumed a significant portion
-  if (ao->buffer_pos > ao->buffer_size / 2) {
-    size_t remaining = ao->buffer_used - ao->buffer_pos;
-    if (remaining > 0) {
-      memmove(ao->buffer, ao->buffer + ao->buffer_pos, remaining);
-    }
-    ao->buffer_used = remaining;
-    ao->buffer_pos = 0;
+  // Keep buffer data contiguous at the front to simplify writes
+  if (ao->buffer_used > 0 && ao->buffer_pos > 0) {
+    memmove(ao->buffer, ao->buffer + ao->buffer_pos, ao->buffer_used);
   }
+  ao->buffer_pos = 0;
 
   // Update audio clock based on bytes written
   if (ao->sample_rate > 0 && ao->channels > 0) {
@@ -296,21 +292,25 @@ API int audio_output_write(audio_output* ao, const uint8_t* data, size_t len) {
 
   pthread_mutex_lock(&ao->mutex);
 
-  // Wait if buffer is too full (account for buffer_pos offset)
-  size_t available_space = ao->buffer_size - (ao->buffer_used - ao->buffer_pos);
+  // Wait if buffer is too full
+  size_t available_space = ao->buffer_size - ao->buffer_used;
   while (len > available_space) {
     pthread_cond_wait(&ao->cond, &ao->mutex);
     if (!ao->playing) {
       pthread_mutex_unlock(&ao->mutex);
       return -1;
     }
-    available_space = ao->buffer_size - (ao->buffer_used - ao->buffer_pos);
+    available_space = ao->buffer_size - ao->buffer_used;
   }
 
-  // Write to end of buffer (after compacting if needed)
-  size_t write_pos = ao->buffer_used - ao->buffer_pos;
-  memcpy(ao->buffer + write_pos, data, len);
-  ao->buffer_used = ao->buffer_pos + write_pos + len;
+  // Ensure data is contiguous at buffer start before writing
+  if (ao->buffer_pos > 0 && ao->buffer_used > 0) {
+    memmove(ao->buffer, ao->buffer + ao->buffer_pos, ao->buffer_used);
+    ao->buffer_pos = 0;
+  }
+
+  memcpy(ao->buffer + ao->buffer_used, data, len);
+  ao->buffer_used += len;
 
   pthread_mutex_unlock(&ao->mutex);
   return 0;
