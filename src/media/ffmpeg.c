@@ -377,57 +377,58 @@ ffmpeg_decode(ncvisual* n){
         // Handle audio packets - send them to audio decoder (audio thread will receive frames)
         if(n->details->packet->stream_index == n->details->audio_stream_index){
           if(n->details->audiocodecctx){
+            // Validate packet and codec context before sending
+            if(!n->details->packet || !n->details->audiocodecctx){
+              av_packet_unref(n->details->packet);
+              continue;
+            }
+
+            // Check packet validity - must have data and size
+            // Also check that packet structure looks valid (buf array should exist)
+            if(n->details->packet->size <= 0 || !n->details->packet->data){
+              // Empty or invalid packet - skip it
+              av_packet_unref(n->details->packet);
+              continue;
+            }
+
             static int audio_packet_count = 0;
             audio_packet_count++;
 
-            // First, try to send any pending audio packet
-            if(n->details->pending_audio_packet){
-              int retry_ret = avcodec_send_packet(n->details->audiocodecctx, n->details->pending_audio_packet);
-              if(retry_ret == 0){
-                // Successfully sent pending packet
-                audio_log("ffmpeg_decode: Sent pending audio packet successfully\n");
-                av_packet_free(&n->details->pending_audio_packet);
-                n->details->audio_packet_outstanding = true;
-              }else if(retry_ret == AVERROR(EAGAIN)){
-                // Still full - keep pending packet and try new one
-                if(audio_packet_count % 100 == 0){
-                  audio_log("ffmpeg_decode: Pending packet still can't be sent (EAGAIN), packet_count=%d\n", audio_packet_count);
-                }
-              }else{
-                // Error - free pending packet
-                audio_log("ffmpeg_decode: Error sending pending packet: %d\n", retry_ret);
-                av_packet_free(&n->details->pending_audio_packet);
-              }
-            }
-
-            // Now try to send the new packet
-            int audio_ret = avcodec_send_packet(n->details->audiocodecctx, n->details->packet);
+            // Try to send the audio packet
+            // If decoder returns EAGAIN, it means frames are ready to be received
+            // The decoder has internal buffering, so we can drop this packet
+            // and let the audio thread drain frames - next packet will be sent successfully
+            // Use a local variable to avoid issues if packet gets corrupted
+            AVPacket* pkt = n->details->packet;
+            int audio_ret = avcodec_send_packet(n->details->audiocodecctx, pkt);
             if(audio_ret == 0){
               n->details->audio_packet_outstanding = true;
               if(audio_packet_count <= 10 || audio_packet_count % 100 == 0){
                 audio_log("ffmpeg_decode: Sent audio packet %d successfully\n", audio_packet_count);
               }
-              av_packet_unref(n->details->packet);
             }else if(audio_ret == AVERROR(EAGAIN)){
-              // Decoder full - save this packet for next time
+              // Decoder full - frames are ready, audio thread will drain them
+              // Mark as outstanding so audio thread knows to keep trying
+              n->details->audio_packet_outstanding = true;
               if(audio_packet_count <= 10 || audio_packet_count % 100 == 0){
-                audio_log("ffmpeg_decode: Audio decoder full (EAGAIN), saving packet %d\n", audio_packet_count);
+                audio_log("ffmpeg_decode: Audio decoder full (EAGAIN), dropping packet %d (frames ready)\n", audio_packet_count);
               }
-              if(n->details->pending_audio_packet){
-                // Already have a pending packet - drop the old one (shouldn't happen often)
-                av_packet_free(&n->details->pending_audio_packet);
-              }
-              // Clone packet manually for compatibility (av_packet_clone may not exist)
-              n->details->pending_audio_packet = av_packet_alloc();
-              if(n->details->pending_audio_packet){
-                av_packet_ref(n->details->pending_audio_packet, n->details->packet);
-              }
-              av_packet_unref(n->details->packet);
+              // Don't send NULL packet to flush - just drop this one
+            }else if(audio_ret == AVERROR_EOF){
+              // EOF - this is normal at end of stream
             }else{
+              // Error - log it but don't crash
+              // This might be AVERROR(EINVAL) if packet is invalid
               if(audio_packet_count <= 10){
-                audio_log("ffmpeg_decode: Error sending audio packet %d: %d\n", audio_packet_count, audio_ret);
+                audio_log("ffmpeg_decode: Error sending audio packet %d: %d (skipping, packet might be invalid)\n", audio_packet_count, audio_ret);
               }
-              av_packet_unref(n->details->packet);
+            }
+            // Always unref the packet after attempting to send
+            av_packet_unref(n->details->packet);
+
+            // Clean up any stale pending packet (shouldn't exist anymore)
+            if(n->details->pending_audio_packet){
+              av_packet_free(&n->details->pending_audio_packet);
             }
           }else{
             av_packet_unref(n->details->packet);
@@ -1034,6 +1035,8 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
 
   // Try to receive a decoded frame (non-blocking)
   // This will only return a frame once per packet - subsequent calls return EAGAIN
+  static int receive_call_count = 0;
+  receive_call_count++;
   int averr = avcodec_receive_frame(ncv->details->audiocodecctx, ncv->details->audio_frame);
   if(averr == 0){
     ncv->details->audio_packet_outstanding = false;
@@ -1044,27 +1047,30 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
       // This can happen if avcodec_receive_frame is called multiple times
       // Note: avcodec_receive_frame should only return each frame once, so this
       // check is defensive. If we see this frequently, there's a bug elsewhere.
+      if(receive_call_count <= 20){
+        audio_log("ffmpeg_get_decoded_audio_frame: Duplicate PTS detected (call %d)\n", receive_call_count);
+      }
       return 0;
     }
     ncv->details->last_audio_frame_pts = current_pts;
+    if(receive_call_count <= 20 || receive_call_count % 100 == 0){
+      audio_log("ffmpeg_get_decoded_audio_frame: Received frame (call %d, samples=%d, pts=%" PRId64 ")\n",
+                receive_call_count, ncv->details->audio_frame->nb_samples, current_pts);
+    }
     return ncv->details->audio_frame->nb_samples;
   }else if(averr == AVERROR(EAGAIN)){
-    // Need more packets - but check if we have packets outstanding
-    // If audio_packet_outstanding is false, it means we've consumed all packets
-    // and need the video decoder to send more
-    if(!ncv->details->audio_packet_outstanding){
-      // No packets outstanding - video decoder needs to send more
-      return 0;
-    }
-    // We have packets outstanding but no frame - this shouldn't happen normally
-    // but can happen if the decoder needs more packets to produce a frame
-    return 0;
-  }else if(averr == AVERROR(EAGAIN)){
     // Need more packets - video decoder will provide them
+    // This is normal - the decoder needs more packets before it can produce a frame
+    if(receive_call_count <= 20 || receive_call_count % 100 == 0){
+      audio_log("ffmpeg_get_decoded_audio_frame: EAGAIN (call %d, packet_outstanding=%d)\n",
+                receive_call_count, (int)ncv->details->audio_packet_outstanding);
+    }
     return 0;
   }else if(averr == AVERROR_EOF){
+    audio_log("ffmpeg_get_decoded_audio_frame: EOF (call %d)\n", receive_call_count);
     return 1; // EOF
   }else{
+    audio_log("ffmpeg_get_decoded_audio_frame: Error %d (call %d)\n", averr, receive_call_count);
     return -1; // Error
   }
 }

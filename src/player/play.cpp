@@ -129,7 +129,13 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       keyp = nc.get(false, &ni);
     }
     if(keyp == 0){
+      // Timeout - check if we should continue
       break;
+    }
+    // Check for 'q' key immediately to allow quitting
+    if(keyp == 'q' && ni.evtype != EvType::Release){
+      ncplane_destroy(subp);
+      return 1;
     }
     // we don't care about key release events, especially the enter
     // release that starts so many interactive programs under Kitty
@@ -389,18 +395,11 @@ static void audio_thread_func(audio_thread_data* data) {
       int out_samples = 0;
       int bytes = ffmpeg_resample_audio(ncv, &out_data, &out_samples);
       if(bytes > 0 && out_data){
-        // Only write if buffer needs data (don't block if buffer is full)
-        if(audio_output_needs_data(ao)){
-          audio_output_write(ao, out_data, bytes);
-          frame_count++;
-          if(frame_count <= 30 || frame_count % 100 == 0){
-            audio_log("Audio thread: Processed frame %d, samples=%d, bytes=%d\n", frame_count, samples, bytes);
-          }
-        }else{
-          // Buffer full - drop this frame (shouldn't happen often)
-          if(frame_count <= 10){
-            audio_log("Audio thread: Buffer full, dropping frame %d\n", frame_count);
-          }
+        // Always write - audio_output_write will handle buffer management
+        audio_output_write(ao, out_data, bytes);
+        frame_count++;
+        if(frame_count <= 30 || frame_count % 100 == 0){
+          audio_log("Audio thread: Processed frame %d, samples=%d, bytes=%d\n", frame_count, samples, bytes);
         }
         free(out_data);
       }else{
@@ -541,10 +540,14 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
 
       ao = audio_output_init(sample_rate, channels, AV_SAMPLE_FMT_S16);
       if(ao){
+        audio_log("Main thread: Audio output initialized, starting playback\n");
         audio_running = true;
         audio_data = new audio_thread_data{raw_ncv, ao, &audio_running, &audio_mutex};
         audio_thread = new std::thread(audio_thread_func, audio_data);
         audio_output_start(ao);
+        audio_log("Main thread: Audio output started, thread created\n");
+      }else{
+        audio_log("Main thread: Failed to initialize audio output\n");
       }
     }
 

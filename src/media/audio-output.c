@@ -80,15 +80,33 @@ static audio_output* g_audio = NULL;
 static bool sdl_initialized = false;
 
 static void audio_callback(void* userdata, uint8_t* stream, int len) {
+  static int callback_count = 0;
+  callback_count++;
   audio_output* ao = (audio_output*)userdata;
   if (!ao || !ao->playing) {
     memset(stream, 0, len);
+    if(callback_count <= 10){
+      FILE* logfile = fopen("/tmp/ncplayer_audio.log", "a");
+      if(logfile){
+        fprintf(logfile, "audio_callback: Not playing (call %d, ao=%p, playing=%d)\n", callback_count, ao, ao ? ao->playing : 0);
+        fclose(logfile);
+      }
+    }
     return;
+  }
+
+  if(callback_count <= 10 || callback_count % 1000 == 0){
+    FILE* logfile = fopen("/tmp/ncplayer_audio.log", "a");
+    if(logfile){
+      fprintf(logfile, "audio_callback: Call %d, len=%d, buffer_used=%zu\n", callback_count, len, ao->buffer_used);
+      fclose(logfile);
+    }
   }
 
   pthread_mutex_lock(&ao->mutex);
 
   size_t bytes_to_write = len;
+  // Calculate available bytes: buffer_used is total bytes written, buffer_pos is bytes consumed
   size_t bytes_available = ao->buffer_used - ao->buffer_pos;
 
   if (bytes_available == 0) {
@@ -104,18 +122,21 @@ static void audio_callback(void* userdata, uint8_t* stream, int len) {
 
   memcpy(stream, ao->buffer + ao->buffer_pos, bytes_to_write);
   ao->buffer_pos += bytes_to_write;
-  ao->buffer_used -= bytes_to_write;
+
+  // Compact buffer if we've consumed a significant portion
+  if (ao->buffer_pos > ao->buffer_size / 2) {
+    size_t remaining = ao->buffer_used - ao->buffer_pos;
+    if (remaining > 0) {
+      memmove(ao->buffer, ao->buffer + ao->buffer_pos, remaining);
+    }
+    ao->buffer_used = remaining;
+    ao->buffer_pos = 0;
+  }
 
   // Update audio clock based on bytes written
   if (ao->sample_rate > 0 && ao->channels > 0) {
     double samples_written = bytes_to_write / (ao->channels * sizeof(int16_t));
     ao->audio_clock += samples_written / ao->sample_rate;
-  }
-
-  // Compact buffer if we've consumed a significant portion
-  if (ao->buffer_pos > ao->buffer_size / 2) {
-    memmove(ao->buffer, ao->buffer + ao->buffer_pos, ao->buffer_used);
-    ao->buffer_pos = 0;
   }
 
   pthread_cond_signal(&ao->cond);
@@ -248,7 +269,14 @@ API void audio_output_start(audio_output* ao) {
   if (!ao) return;
   ao->playing = true;
   ao->paused = false;
-  sdl2.SDL_PauseAudioDevice(ao->device_id, 0);
+  if(sdl2.SDL_PauseAudioDevice){
+    sdl2.SDL_PauseAudioDevice(ao->device_id, 0);
+    FILE* logfile = fopen("/tmp/ncplayer_audio.log", "a");
+    if(logfile){
+      fprintf(logfile, "audio_output_start: SDL_PauseAudioDevice called, device_id=%u\n", ao->device_id);
+      fclose(logfile);
+    }
+  }
 }
 
 API void audio_output_pause(audio_output* ao) {
@@ -268,17 +296,21 @@ API int audio_output_write(audio_output* ao, const uint8_t* data, size_t len) {
 
   pthread_mutex_lock(&ao->mutex);
 
-  // Wait if buffer is too full
-  while (ao->buffer_used + len > ao->buffer_size) {
+  // Wait if buffer is too full (account for buffer_pos offset)
+  size_t available_space = ao->buffer_size - (ao->buffer_used - ao->buffer_pos);
+  while (len > available_space) {
     pthread_cond_wait(&ao->cond, &ao->mutex);
     if (!ao->playing) {
       pthread_mutex_unlock(&ao->mutex);
       return -1;
     }
+    available_space = ao->buffer_size - (ao->buffer_used - ao->buffer_pos);
   }
 
-  memcpy(ao->buffer + ao->buffer_pos + ao->buffer_used, data, len);
-  ao->buffer_used += len;
+  // Write to end of buffer (after compacting if needed)
+  size_t write_pos = ao->buffer_used - ao->buffer_pos;
+  memcpy(ao->buffer + write_pos, data, len);
+  ao->buffer_used = ao->buffer_pos + write_pos + len;
 
   pthread_mutex_unlock(&ao->mutex);
   return 0;
