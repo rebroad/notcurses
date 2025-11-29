@@ -1108,6 +1108,16 @@ ffmpeg_destroy(ncvisual* ncv){
 #define API __declspec(dllexport)
 #endif
 
+API void
+ffmpeg_audio_request_packets(ncvisual* ncv){
+  if(!ncv || !ncv->details){
+    return;
+  }
+  pthread_mutex_lock(&ncv->details->audio_packet_mutex);
+  ffmpeg_drain_pending_audio_locked(ncv->details);
+  pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
+}
+
 // Check if the visual has an audio stream
 API bool
 ffmpeg_has_audio(ncvisual* ncv){

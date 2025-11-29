@@ -39,6 +39,7 @@ AVFrame* ffmpeg_get_audio_frame(ncvisual* ncv);
 int ffmpeg_init_audio_resampler(ncvisual* ncv, int out_sample_rate, int out_channels);
 int ffmpeg_get_audio_sample_rate(ncvisual* ncv);
 int ffmpeg_get_audio_channels(ncvisual* ncv);
+void ffmpeg_audio_request_packets(ncvisual* ncv);
 }
 
 static void usage(std::ostream& os, const char* name, int exitcode)
@@ -446,41 +447,44 @@ static void audio_thread_func(audio_thread_data* data) {
   auto last_log = std::chrono::steady_clock::now();
   int frames_since_log = 0;
   while(*running){
+    ffmpeg_audio_request_packets(ncv);
     // Get decoded audio frame (packets are read by video decoder)
     // IMPORTANT: avcodec_receive_frame can only return each frame once
     // So we must process the frame immediately and not call get_decoded_audio_frame again
     // until we've finished processing
     int samples = ffmpeg_get_decoded_audio_frame(ncv);
     if(samples > 0){
-      consecutive_eagain = 0;
-      // Resample and write to audio output immediately
-      // Don't call get_decoded_audio_frame again until this is done
-      uint8_t* out_data = nullptr;
-      int out_samples = 0;
-      int bytes = ffmpeg_resample_audio(ncv, &out_data, &out_samples);
-      if(bytes > 0 && out_data){
-        // Always write - audio_output_write will handle buffer management
-        audio_output_write(ao, out_data, bytes);
-        frame_count++;
-        frames_since_log++;
-        if(frame_count <= 30 || frame_count % 100 == 0){
-          audio_log("Audio thread: Processed frame %d, samples=%d, bytes=%d\n", frame_count, samples, bytes);
+      do{
+        consecutive_eagain = 0;
+        uint8_t* out_data = nullptr;
+        int out_samples = 0;
+        int bytes = ffmpeg_resample_audio(ncv, &out_data, &out_samples);
+        if(bytes > 0 && out_data){
+          audio_output_write(ao, out_data, bytes);
+          frame_count++;
+          frames_since_log++;
+          if(frame_count <= 30 || frame_count % 100 == 0){
+            audio_log("Audio thread: Processed frame %d, samples=%d, bytes=%d\n", frame_count, samples, bytes);
+          }
+          auto now = std::chrono::steady_clock::now();
+          auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count();
+          if(elapsed >= 1000){
+            audio_log("Audio thread: last second frames=%d (frame_count=%d)\n", frames_since_log, frame_count);
+            frames_since_log = 0;
+            last_log = now;
+          }
+          free(out_data);
+        }else{
+          if(frame_count <= 30){
+            audio_log("Audio thread: Frame %d resample failed: bytes=%d\n", frame_count, bytes);
+          }
         }
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count();
-        if(elapsed >= 1000){
-          audio_log("Audio thread: last second frames=%d (frame_count=%d)\n", frames_since_log, frame_count);
-          frames_since_log = 0;
-          last_log = now;
-        }
-        free(out_data);
-      }else{
-        if(frame_count <= 30){
-          audio_log("Audio thread: Frame %d resample failed: bytes=%d\n", frame_count, bytes);
-        }
+        samples = ffmpeg_get_decoded_audio_frame(ncv);
+      }while(samples > 0 && audio_output_needs_data(ao));
+      if(!audio_output_needs_data(ao)){
+        usleep(1000);
       }
-      // Small delay to prevent overwhelming the system
-      usleep(1000); // 1ms delay after processing frame
+      continue;
     }else if(samples == 1){
       // EOF - don't break, just wait for more data (video might still be playing)
       consecutive_eagain = 0;
@@ -491,16 +495,13 @@ static void audio_thread_func(audio_thread_data* data) {
       audio_log("Audio thread: Error from get_decoded_audio_frame: %d (frame_count=%d)\n", samples, frame_count);
       break;
     }else{
-      // No frame available yet (EAGAIN) - yield to video thread
       consecutive_eagain++;
-      if(frame_count <= 30 || consecutive_eagain % 100 == 0){
+      if(frame_count <= 30 || consecutive_eagain % 50 == 0){
         audio_log("Audio thread: No frame available (EAGAIN), frame_count=%d, consecutive=%d\n", frame_count, consecutive_eagain);
       }
-      // If buffer needs data but we're not getting frames, yield longer
-      if(audio_output_needs_data(ao)){
-        usleep(1000); // 1ms - buffer needs data, check frequently
-      }else{
-        usleep(10000); // 10ms - buffer full, yield longer
+      ffmpeg_audio_request_packets(ncv);
+      if(!audio_output_needs_data(ao)){
+        usleep(1000);
       }
     }
   }
