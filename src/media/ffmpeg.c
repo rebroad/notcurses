@@ -64,9 +64,10 @@ typedef struct ncvisual_details {
   int audio_stream_index;  // audio stream index, can be < 0 if no audio
   bool packet_outstanding;
   bool audio_packet_outstanding; // whether we have an audio packet waiting to be decoded
-  AVPacket* pending_audio_packet; // audio packet that couldn't be sent (decoder full)
+  AVPacket* pending_audio_packet; // audio packet that couldn't be sent (decoder full) - queue of 1
   int64_t last_audio_frame_pts; // PTS of last processed audio frame (to prevent reprocessing)
   pthread_mutex_t packet_mutex;  // mutex for thread-safe packet reading
+  pthread_mutex_t audio_packet_mutex; // mutex for audio packet queue
 } ncvisual_details;
 
 #define IMGALLOCALIGN 64
@@ -384,7 +385,6 @@ ffmpeg_decode(ncvisual* n){
             }
 
             // Check packet validity - must have data and size
-            // Also check that packet structure looks valid (buf array should exist)
             if(n->details->packet->size <= 0 || !n->details->packet->data){
               // Empty or invalid packet - skip it
               av_packet_unref(n->details->packet);
@@ -394,42 +394,64 @@ ffmpeg_decode(ncvisual* n){
             static int audio_packet_count = 0;
             audio_packet_count++;
 
-            // Try to send the audio packet
-            // If decoder returns EAGAIN, it means frames are ready to be received
-            // The decoder has internal buffering, so we can drop this packet
-            // and let the audio thread drain frames - next packet will be sent successfully
-            // Use a local variable to avoid issues if packet gets corrupted
-            AVPacket* pkt = n->details->packet;
-            int audio_ret = avcodec_send_packet(n->details->audiocodecctx, pkt);
+            pthread_mutex_lock(&n->details->audio_packet_mutex);
+
+            // First, try to send any pending packet
+            if(n->details->pending_audio_packet){
+              int retry_ret = avcodec_send_packet(n->details->audiocodecctx, n->details->pending_audio_packet);
+              if(retry_ret == 0){
+                // Successfully sent pending packet
+                av_packet_free(&n->details->pending_audio_packet);
+                n->details->audio_packet_outstanding = true;
+                if(audio_packet_count <= 10 || audio_packet_count % 100 == 0){
+                  audio_log("ffmpeg_decode: Sent pending audio packet successfully\n");
+                }
+              }else if(retry_ret != AVERROR(EAGAIN)){
+                // Error - free it
+                av_packet_free(&n->details->pending_audio_packet);
+              }
+              // If still EAGAIN, keep the pending packet
+            }
+
+            // Now try to send the new packet
+            int audio_ret = avcodec_send_packet(n->details->audiocodecctx, n->details->packet);
             if(audio_ret == 0){
               n->details->audio_packet_outstanding = true;
               if(audio_packet_count <= 10 || audio_packet_count % 100 == 0){
                 audio_log("ffmpeg_decode: Sent audio packet %d successfully\n", audio_packet_count);
               }
+              av_packet_unref(n->details->packet);
             }else if(audio_ret == AVERROR(EAGAIN)){
-              // Decoder full - frames are ready, audio thread will drain them
-              // Mark as outstanding so audio thread knows to keep trying
-              n->details->audio_packet_outstanding = true;
-              if(audio_packet_count <= 10 || audio_packet_count % 100 == 0){
-                audio_log("ffmpeg_decode: Audio decoder full (EAGAIN), dropping packet %d (frames ready)\n", audio_packet_count);
+              // Decoder full - save this packet for next time
+              if(!n->details->pending_audio_packet){
+                // Queue this packet
+                n->details->pending_audio_packet = av_packet_alloc();
+                if(n->details->pending_audio_packet){
+                  av_packet_ref(n->details->pending_audio_packet, n->details->packet);
+                }
+                n->details->audio_packet_outstanding = true;
+                if(audio_packet_count <= 10 || audio_packet_count % 100 == 0){
+                  audio_log("ffmpeg_decode: Audio decoder full (EAGAIN), queuing packet %d\n", audio_packet_count);
+                }
+              }else{
+                // Already have pending packet - drop this one (queue full)
+                if(audio_packet_count <= 10 || audio_packet_count % 100 == 0){
+                  audio_log("ffmpeg_decode: Audio queue full, dropping packet %d\n", audio_packet_count);
+                }
               }
-              // Don't send NULL packet to flush - just drop this one
+              av_packet_unref(n->details->packet);
             }else if(audio_ret == AVERROR_EOF){
               // EOF - this is normal at end of stream
+              av_packet_unref(n->details->packet);
             }else{
               // Error - log it but don't crash
-              // This might be AVERROR(EINVAL) if packet is invalid
               if(audio_packet_count <= 10){
-                audio_log("ffmpeg_decode: Error sending audio packet %d: %d (skipping, packet might be invalid)\n", audio_packet_count, audio_ret);
+                audio_log("ffmpeg_decode: Error sending audio packet %d: %d (skipping)\n", audio_packet_count, audio_ret);
               }
+              av_packet_unref(n->details->packet);
             }
-            // Always unref the packet after attempting to send
-            av_packet_unref(n->details->packet);
 
-            // Clean up any stale pending packet (shouldn't exist anymore)
-            if(n->details->pending_audio_packet){
-              av_packet_free(&n->details->pending_audio_packet);
-            }
+            pthread_mutex_unlock(&n->details->audio_packet_mutex);
           }else{
             av_packet_unref(n->details->packet);
           }
@@ -484,6 +506,11 @@ ffmpeg_details_init(void){
     deets->audio_out_channels = 0; // Will be set when resampler is initialized
     deets->pending_audio_packet = NULL; // No pending packet initially
     if(pthread_mutex_init(&deets->packet_mutex, NULL) != 0){
+      free(deets);
+      return NULL;
+    }
+    if(pthread_mutex_init(&deets->audio_packet_mutex, NULL) != 0){
+      pthread_mutex_destroy(&deets->packet_mutex);
       free(deets);
       return NULL;
     }
@@ -981,6 +1008,7 @@ ffmpeg_details_destroy(ncvisual_details* deets){
   av_packet_free(&deets->packet);
   avformat_close_input(&deets->fmtctx);
   avsubtitle_free(&deets->subtitle);
+  pthread_mutex_destroy(&deets->audio_packet_mutex);
   pthread_mutex_destroy(&deets->packet_mutex);
   free(deets);
 }
