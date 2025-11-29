@@ -97,7 +97,8 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_video_log).count();
     if(elapsed >= 1000){
       double fps = (elapsed > 0) ? (video_frames_since_log * 1000.0 / elapsed) : 0.0;
-      audio_log("Video thread: FPS=%.2f (frame=%d)\n", fps, marsh->framecount);
+      audio_log("Video thread: FPS=%.2f (frame=%d, drops=%" PRIu64 ")\n",
+                fps, marsh->framecount, marsh->dropped_frames);
       video_frames_since_log = 0;
       last_video_log = now;
     }
@@ -463,7 +464,7 @@ static void audio_thread_func(audio_thread_data* data) {
           audio_output_write(ao, out_data, bytes);
           frame_count++;
           frames_since_log++;
-          if(frame_count <= 30 || frame_count % 100 == 0){
+          if(frame_count <= 10 || frame_count % 200 == 0){
             audio_log("Audio thread: Processed frame %d, samples=%d, bytes=%d\n", frame_count, samples, bytes);
           }
           auto now = std::chrono::steady_clock::now();

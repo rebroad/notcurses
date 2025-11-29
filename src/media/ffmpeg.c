@@ -1165,10 +1165,11 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
       outstanding = false;
     }
     pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
-    if(receive_call_count <= 20 || receive_call_count % 100 == 0 ||
-       frame_counter % 50 == 0){
-      audio_log("ffmpeg_get_decoded_audio_frame: Frame received, pending queue=%d, total_frames=%d\n",
-                pending_after, frame_counter);
+    if(receive_call_count <= 20 || receive_call_count % 100 == 0 || frame_counter % 50 == 0){
+      if(frame_counter <= 20 || frame_counter % 200 == 0){
+        audio_log("ffmpeg_get_decoded_audio_frame: Frame received, pending queue=%d, total_frames=%d\n",
+                  pending_after, frame_counter);
+      }
     }
 
     // Check if this is a new frame (different PTS) or the same one we already processed
@@ -1193,7 +1194,7 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
     pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
     // Need more packets - video decoder will provide them
     // This is normal - the decoder needs more packets before it can produce a frame
-    if(receive_call_count <= 20 || receive_call_count % 100 == 0){
+    if(receive_call_count <= 20 || receive_call_count % 200 == 0){
       audio_log("ffmpeg_get_decoded_audio_frame: EAGAIN (call %d, packet_outstanding=%d, pending=%d)\n",
                 receive_call_count, (int)outstanding, pending_after);
     }
