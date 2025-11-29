@@ -9,9 +9,13 @@
 #include <libavutil/rational.h>
 #include <libswscale/swscale.h>
 #include <libswscale/version.h>
+#include <libswresample/swresample.h>
+#include <libswresample/version.h>
 #include <libavdevice/avdevice.h>
 #include <libavformat/version.h>
 #include <libavformat/avformat.h>
+#include <libavutil/samplefmt.h>
+#include <libavutil/channel_layout.h>
 #include "lib/visual-details.h"
 #include "lib/internal.h"
 
@@ -26,16 +30,23 @@ typedef struct ncvisual_details {
   struct AVFormatContext* fmtctx;
   struct AVCodecContext* codecctx;     // video codec context
   struct AVCodecContext* subtcodecctx; // subtitle codec context
+  struct AVCodecContext* audiocodecctx; // audio codec context
   struct AVFrame* frame;               // frame as read/loaded/converted
+  struct AVFrame* audio_frame;         // decoded audio frame
   struct AVCodec* codec;
   struct AVCodec* subtcodec;
+  struct AVCodec* audiocodec;
   struct AVPacket* packet;
   struct SwsContext* swsctx;
   struct SwsContext* rgbactx;
+  struct SwrContext* swrctx;           // audio resampler context
   AVSubtitle subtitle;
   int stream_index;        // match against this following av_read_frame()
   int sub_stream_index;    // subtitle stream index, can be < 0 if no subtitles
+  int audio_stream_index;  // audio stream index, can be < 0 if no audio
   bool packet_outstanding;
+  bool audio_packet_outstanding; // whether we have an audio packet waiting to be decoded
+  pthread_mutex_t packet_mutex;  // mutex for thread-safe packet reading
 } ncvisual_details;
 
 #define IMGALLOCALIGN 64
@@ -322,13 +333,17 @@ ffmpeg_decode(ncvisual* n){
           av_packet_unref(n->details->packet);
         }
         int averr;
-        if((averr = av_read_frame(n->details->fmtctx, n->details->packet)) < 0){
+        // Single point for reading packets - no mutex needed as only video decoder reads
+        averr = av_read_frame(n->details->fmtctx, n->details->packet);
+        if(averr < 0){
           /*if(averr != AVERROR_EOF){
             fprintf(stderr, "Error reading frame info (%s)\n", av_err2str(averr));
           }*/
           return averr2ncerr(averr);
         }
         unref = true;
+
+        // Handle subtitle packets
         if(n->details->packet->stream_index == n->details->sub_stream_index){
           int result = 0, ret;
           avsubtitle_free(&n->details->subtitle);
@@ -336,8 +351,39 @@ ffmpeg_decode(ncvisual* n){
           if(ret >= 0 && result){
             // FIXME?
           }
+          continue; // Continue reading, this wasn't a video packet
         }
-      }while(n->details->packet->stream_index != n->details->stream_index);
+
+        // Handle audio packets - send them to audio decoder (audio thread will receive frames)
+        if(n->details->packet->stream_index == n->details->audio_stream_index){
+          if(n->details->audiocodecctx){
+            // Send packet to audio decoder (audio thread will receive decoded frames)
+            // Keep trying to send if decoder is full (audio thread will drain it)
+            int audio_ret;
+            int retry_count = 0;
+            do{
+              audio_ret = avcodec_send_packet(n->details->audiocodecctx, n->details->packet);
+              if(audio_ret == AVERROR(EAGAIN)){
+                // Decoder full - audio thread needs to receive frames first
+                // Don't retry here - let audio thread drain it
+                n->details->audio_packet_outstanding = true;
+                break;
+              }else if(audio_ret == 0){
+                n->details->audio_packet_outstanding = true;
+                break;
+              }else if(audio_ret < 0 && audio_ret != AVERROR_EOF){
+                // Error sending packet
+                break;
+              }
+            }while(++retry_count < 10); // Safety limit
+          }
+          av_packet_unref(n->details->packet);
+          continue; // Continue reading, this wasn't a video packet
+        }
+
+        // This is a video packet - break out of loop to process it
+        break;
+      }while(1);
       n->details->packet_outstanding = true;
       int averr = avcodec_send_packet(n->details->codecctx, n->details->packet);
       if(averr < 0){
@@ -378,7 +424,19 @@ ffmpeg_details_init(void){
     memset(deets, 0, sizeof(*deets));
     deets->stream_index = -1;
     deets->sub_stream_index = -1;
+    deets->audio_stream_index = -1;
+    if(pthread_mutex_init(&deets->packet_mutex, NULL) != 0){
+      free(deets);
+      return NULL;
+    }
     if((deets->frame = av_frame_alloc()) == NULL){
+      pthread_mutex_destroy(&deets->packet_mutex);
+      free(deets);
+      return NULL;
+    }
+    if((deets->audio_frame = av_frame_alloc()) == NULL){
+      av_frame_free(&deets->frame);
+      pthread_mutex_destroy(&deets->packet_mutex);
       free(deets);
       return NULL;
     }
@@ -437,6 +495,27 @@ ffmpeg_from_file(const char* filename){
   }else{
     ncv->details->sub_stream_index = -1;
   }
+  // Find audio stream (similar to subtitle detection)
+  if((averr = av_find_best_stream(ncv->details->fmtctx, AVMEDIA_TYPE_AUDIO, -1, -1,
+#if LIBAVFORMAT_VERSION_MAJOR >= 59
+                                  (const AVCodec**)&ncv->details->audiocodec, 0)) >= 0){
+#else
+                                  &ncv->details->audiocodec, 0)) >= 0){
+#endif
+    ncv->details->audio_stream_index = averr;
+    AVStream* ast = ncv->details->fmtctx->streams[ncv->details->audio_stream_index];
+    if((ncv->details->audiocodecctx = avcodec_alloc_context3(ncv->details->audiocodec)) == NULL){
+      goto err;
+    }
+    if(avcodec_parameters_to_context(ncv->details->audiocodecctx, ast->codecpar) < 0){
+      goto err;
+    }
+    if(avcodec_open2(ncv->details->audiocodecctx, ncv->details->audiocodec, NULL) < 0){
+      goto err;
+    }
+  }else{
+    ncv->details->audio_stream_index = -1;
+  }
 //fprintf(stderr, "FRAME FRAME: %p\n", ncv->details->frame);
   if((ncv->details->packet = av_packet_alloc()) == NULL){
     // fprintf(stderr, "Couldn't allocate packet for %s\n", filename);
@@ -479,6 +558,113 @@ ffmpeg_from_file(const char* filename){
 err:
   ncvisual_destroy(ncv);
   return NULL;
+}
+
+// Decode audio packet and return number of samples decoded
+// Returns: >0 = samples decoded, 0 = need more data, <0 = error
+// This function is safe to call - it doesn't interfere with video decoding
+static int
+ffmpeg_decode_audio_internal(ncvisual* ncv, AVPacket* packet){
+  if(!ncv->details->audiocodecctx || ncv->details->audio_stream_index < 0){
+    return -1;
+  }
+
+  // Send packet to decoder if provided
+  if(packet && packet->stream_index == ncv->details->audio_stream_index){
+    int averr = avcodec_send_packet(ncv->details->audiocodecctx, packet);
+    if(averr < 0 && averr != AVERROR(EAGAIN) && averr != AVERROR_EOF){
+      return averr2ncerr(averr);
+    }
+    ncv->details->audio_packet_outstanding = (averr == 0);
+  }
+
+  // If no packet outstanding, return 0 (need more data)
+  if(!ncv->details->audio_packet_outstanding){
+    return 0;
+  }
+
+  // Receive decoded frame
+  int averr = avcodec_receive_frame(ncv->details->audiocodecctx, ncv->details->audio_frame);
+  if(averr == 0){
+    ncv->details->audio_packet_outstanding = false;
+    return ncv->details->audio_frame->nb_samples;
+  }else if(averr == AVERROR(EAGAIN)){
+    return 0; // need more packets
+  }else if(averr == AVERROR_EOF){
+    return 1; // EOF
+  }else{
+    return averr2ncerr(averr);
+  }
+}
+
+// Initialize audio resampler for converting to output format
+// Returns 0 on success, <0 on error
+// This function is safe to call - it doesn't interfere with video decoding
+static int
+ffmpeg_init_audio_resampler_internal(ncvisual* ncv, int out_sample_rate, int out_channels){
+  if(!ncv->details->audiocodecctx || ncv->details->audio_stream_index < 0){
+    return -1;
+  }
+
+  AVCodecContext* acodecctx = ncv->details->audiocodecctx;
+
+  // Free existing resampler if any
+  if(ncv->details->swrctx){
+    swr_free(&ncv->details->swrctx);
+  }
+
+  // Use older API with channel masks (more stable)
+  uint64_t in_channel_mask = 0;
+  uint64_t out_channel_mask = 0;
+
+  // Get input channel count
+  int in_ch_count = 0;
+  if(acodecctx->ch_layout.nb_channels > 0){
+    in_ch_count = acodecctx->ch_layout.nb_channels;
+  }else{
+    // Fallback for older FFmpeg versions
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    in_ch_count = acodecctx->channels;
+    #pragma GCC diagnostic pop
+  }
+
+  // Map channel count to standard layout masks
+  if(in_ch_count == 1){
+    in_channel_mask = AV_CH_LAYOUT_MONO;
+  }else if(in_ch_count == 2){
+    in_channel_mask = AV_CH_LAYOUT_STEREO;
+  }else if(in_ch_count == 6){
+    in_channel_mask = AV_CH_LAYOUT_5POINT1;
+  }else if(in_ch_count == 4){
+    in_channel_mask = AV_CH_LAYOUT_QUAD;
+  }else if(in_ch_count == 8){
+    in_channel_mask = AV_CH_LAYOUT_7POINT1;
+  }else{
+    // Default to stereo for unknown channel counts
+    in_channel_mask = AV_CH_LAYOUT_STEREO;
+    in_ch_count = 2;
+  }
+
+  out_channel_mask = (out_channels == 1) ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
+
+  ncv->details->swrctx = swr_alloc_set_opts(
+    NULL,
+    out_channel_mask, AV_SAMPLE_FMT_S16, out_sample_rate,
+    in_channel_mask, acodecctx->sample_fmt, acodecctx->sample_rate,
+    0, NULL);
+
+  if(!ncv->details->swrctx){
+    return -1;
+  }
+
+  int ret = swr_init(ncv->details->swrctx);
+  if(ret < 0){
+    swr_free(&ncv->details->swrctx);
+    return -1;
+  }
+
+  return 0;
 }
 
 // iterate over the decoded frames, calling streamer() with curry for each.
@@ -719,13 +905,17 @@ static void
 ffmpeg_details_destroy(ncvisual_details* deets){
   // avcodec_close() is deprecated; avcodec_free_context() suffices
   avcodec_free_context(&deets->subtcodecctx);
+  avcodec_free_context(&deets->audiocodecctx);
   avcodec_free_context(&deets->codecctx);
   av_frame_free(&deets->frame);
+  av_frame_free(&deets->audio_frame);
+  swr_free(&deets->swrctx);
   sws_freeContext(deets->rgbactx);
   sws_freeContext(deets->swsctx);
   av_packet_free(&deets->packet);
   avformat_close_input(&deets->fmtctx);
   avsubtitle_free(&deets->subtitle);
+  pthread_mutex_destroy(&deets->packet_mutex);
   free(deets);
 }
 
@@ -738,6 +928,151 @@ ffmpeg_destroy(ncvisual* ncv){
     }
     free(ncv);
   }
+}
+
+// Public API functions for audio handling (called from play.cpp)
+// Define API macro for visibility export
+#ifndef __MINGW32__
+#define API __attribute__((visibility("default")))
+#else
+#define API __declspec(dllexport)
+#endif
+
+// Check if the visual has an audio stream
+API bool
+ffmpeg_has_audio(ncvisual* ncv){
+  return ncv && ncv->details && ncv->details->audio_stream_index >= 0 &&
+         ncv->details->audiocodecctx != NULL;
+}
+
+// Decode audio packet (public wrapper)
+API int
+ffmpeg_decode_audio(ncvisual* ncv, AVPacket* packet){
+  return ffmpeg_decode_audio_internal(ncv, packet);
+}
+
+// Initialize audio resampler (public wrapper)
+API int
+ffmpeg_init_audio_resampler(ncvisual* ncv, int out_sample_rate, int out_channels){
+  return ffmpeg_init_audio_resampler_internal(ncv, out_sample_rate, out_channels);
+}
+
+// Try to get a decoded audio frame (packets are read by video decoder)
+// Returns: >0 = samples decoded, 0 = no frame available, <0 = error
+// This function is called by the audio thread - it doesn't read packets
+API int
+ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
+  if(!ncv || !ncv->details || ncv->details->audio_stream_index < 0){
+    return -1;
+  }
+
+  // Try to receive a decoded frame (non-blocking)
+  // Don't check audio_packet_outstanding - just try to receive
+  // The decoder might have frames ready even if we haven't sent a packet recently
+  int averr = avcodec_receive_frame(ncv->details->audiocodecctx, ncv->details->audio_frame);
+  if(averr == 0){
+    ncv->details->audio_packet_outstanding = false;
+    return ncv->details->audio_frame->nb_samples;
+  }else if(averr == AVERROR(EAGAIN)){
+    // Need more packets - video decoder will provide them
+    return 0;
+  }else if(averr == AVERROR_EOF){
+    return 1; // EOF
+  }else{
+    return -1; // Error
+  }
+}
+
+// Resample audio frame to output format
+// Returns: number of samples output, <0 on error
+API int
+ffmpeg_resample_audio(ncvisual* ncv, uint8_t** out_data, int* out_samples){
+  if(!ncv || !ncv->details || !ncv->details->swrctx || !ncv->details->audio_frame){
+    return -1;
+  }
+
+  AVFrame* frame = ncv->details->audio_frame;
+  if(frame->nb_samples <= 0){
+    return 0;
+  }
+
+  // Calculate output buffer size
+  int64_t out_count = swr_get_out_samples(ncv->details->swrctx, frame->nb_samples);
+  if(out_count < 0){
+    return -1;
+  }
+
+  int out_channels = ncv->details->audiocodecctx->ch_layout.nb_channels;
+  if(out_channels == 0){
+    // Fallback for older FFmpeg
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    out_channels = ncv->details->audiocodecctx->channels;
+    #pragma GCC diagnostic pop
+  }
+
+  int out_size = av_samples_get_buffer_size(NULL, out_channels, out_count,
+                                            AV_SAMPLE_FMT_S16, 1);
+  if(out_size < 0){
+    return -1;
+  }
+
+  // Allocate output buffer
+  *out_data = malloc(out_size);
+  if(!*out_data){
+    return -1;
+  }
+
+  // Perform resampling
+  uint8_t* out_ptr = *out_data;
+  int samples_out = swr_convert(ncv->details->swrctx, &out_ptr, out_count,
+                                (const uint8_t**)frame->data, frame->nb_samples);
+
+  if(samples_out < 0){
+    free(*out_data);
+    *out_data = NULL;
+    return -1;
+  }
+
+  *out_samples = samples_out;
+  return samples_out * out_channels * sizeof(int16_t); // Return bytes
+}
+
+// Get the decoded audio frame (for getting sample rate, channels, etc.)
+API AVFrame*
+ffmpeg_get_audio_frame(ncvisual* ncv){
+  if(!ncv || !ncv->details){
+    return NULL;
+  }
+  return ncv->details->audio_frame;
+}
+
+// Get audio sample rate from codec context
+API int
+ffmpeg_get_audio_sample_rate(ncvisual* ncv){
+  if(!ncv || !ncv->details || !ncv->details->audiocodecctx){
+    return 44100; // Default
+  }
+  return ncv->details->audiocodecctx->sample_rate > 0 ?
+         ncv->details->audiocodecctx->sample_rate : 44100;
+}
+
+// Get audio channel count from codec context
+API int
+ffmpeg_get_audio_channels(ncvisual* ncv){
+  if(!ncv || !ncv->details || !ncv->details->audiocodecctx){
+    return 2; // Default stereo
+  }
+  AVCodecContext* acodecctx = ncv->details->audiocodecctx;
+  int channels = acodecctx->ch_layout.nb_channels;
+  if(channels == 0){
+    // Fallback for older FFmpeg
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    channels = acodecctx->channels;
+    #pragma GCC diagnostic pop
+  }
+  return channels > 0 ? channels : 2; // Default stereo
 }
 
 ncvisual_implementation local_visual_implementation = {

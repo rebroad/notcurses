@@ -10,12 +10,33 @@
 #include <unistd.h>
 #include <iostream>
 #include <inttypes.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavcodec/packet.h>
+#include <libavutil/frame.h>
+#include <libavutil/samplefmt.h>
+}
 #include <ncpp/Direct.hh>
 #include <ncpp/Visual.hh>
 #include <ncpp/NotCurses.hh>
 #include "compat/compat.h"
+#include "media/audio-output.h"
 
 using namespace ncpp;
+
+// Forward declarations for audio API functions from ffmpeg.c
+extern "C" {
+bool ffmpeg_has_audio(ncvisual* ncv);
+int ffmpeg_get_decoded_audio_frame(ncvisual* ncv);
+int ffmpeg_resample_audio(ncvisual* ncv, uint8_t** out_data, int* out_samples);
+AVFrame* ffmpeg_get_audio_frame(ncvisual* ncv);
+int ffmpeg_init_audio_resampler(ncvisual* ncv, int out_sample_rate, int out_channels);
+int ffmpeg_get_audio_sample_rate(ncvisual* ncv);
+int ffmpeg_get_audio_channels(ncvisual* ncv);
+}
 
 static void usage(std::ostream& os, const char* name, int exitcode)
   __attribute__ ((noreturn));
@@ -297,6 +318,81 @@ auto handle_opts(int argc, char** argv, notcurses_options& opts, bool* quiet,
   return optind;
 }
 
+// Audio thread data structure
+struct audio_thread_data {
+  ncvisual* ncv;
+  audio_output* ao;
+  std::atomic<bool>* running;
+  std::mutex* mutex;
+};
+
+// Audio thread function - processes decoded frames (video decoder reads packets)
+static void audio_thread_func(audio_thread_data* data) {
+  ncvisual* ncv = data->ncv;
+  audio_output* ao = data->ao;
+  std::atomic<bool>* running = data->running;
+
+  if(!ffmpeg_has_audio(ncv) || !ao){
+    return;
+  }
+
+  // Initialize resampler - convert FROM codec format TO fixed output format
+  // Output format: 44100Hz, stereo (or mono), S16
+  int out_sample_rate = 44100; // Fixed output sample rate
+  int out_channels = ffmpeg_get_audio_channels(ncv);
+  // Limit to stereo max for output
+  if(out_channels > 2){
+    out_channels = 2;
+  }
+
+  if(ffmpeg_init_audio_resampler(ncv, out_sample_rate, out_channels) < 0){
+    return;
+  }
+
+  while(*running){
+    // Only process frames when buffer needs data
+    if(!audio_output_needs_data(ao)){
+      usleep(10000); // 10ms delay when buffer is full
+      continue;
+    }
+
+    // Get decoded audio frame (packets are read by video decoder)
+    int samples = ffmpeg_get_decoded_audio_frame(ncv);
+    if(samples > 0){
+      // Resample and write to audio output
+      uint8_t* out_data = nullptr;
+      int out_samples = 0;
+      int bytes = ffmpeg_resample_audio(ncv, &out_data, &out_samples);
+      if(bytes > 0 && out_data){
+        audio_output_write(ao, out_data, bytes);
+        free(out_data);
+      }
+    }else if(samples < 0){
+      // Error or EOF
+      break;
+    }else{
+      // No frame available yet - yield to video thread
+      usleep(1000); // 1ms delay
+    }
+  }
+
+  // Flush any remaining frames at EOF
+  while(*running){
+    int samples = ffmpeg_get_decoded_audio_frame(ncv);
+    if(samples > 0){
+      uint8_t* out_data = nullptr;
+      int out_samples = 0;
+      int bytes = ffmpeg_resample_audio(ncv, &out_data, &out_samples);
+      if(bytes > 0 && out_data){
+        audio_output_write(ao, out_data, bytes);
+        free(out_data);
+      }
+    }else{
+      break; // No more frames
+    }
+  }
+}
+
 int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
                                ncscale_e scalemode, ncblitter_e blitter,
                                bool quiet, bool loop,
@@ -318,6 +414,14 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
   nopts.flags = NCPLANE_OPTION_MARGINALIZED;
   ncplane* n = nullptr;
   ncplane* clin = nullptr;
+
+  // Audio-related variables (declared at function scope for cleanup)
+  audio_output* ao = nullptr;
+  std::thread* audio_thread = nullptr;
+  std::atomic<bool> audio_running(false);
+  std::mutex audio_mutex;
+  audio_thread_data* audio_data = nullptr;
+
   for(auto i = 0 ; i < argc ; ++i){
     std::unique_ptr<Visual> ncv;
     ncv = std::make_unique<Visual>(argv[i]);
@@ -359,6 +463,27 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       ncplane_scrollup_child(*stdn, clin);
     }
     ncplane_erase(n);
+
+    // Initialize audio if available
+    ncvisual* raw_ncv = *ncv;  // Get underlying ncvisual pointer
+    if(ffmpeg_has_audio(raw_ncv)){
+      // Use fixed output format for audio output (resampler will convert)
+      int sample_rate = 44100; // Fixed output sample rate
+      int channels = ffmpeg_get_audio_channels(raw_ncv);
+      // Limit to stereo max for output
+      if(channels > 2){
+        channels = 2;
+      }
+
+      ao = audio_output_init(sample_rate, channels, AV_SAMPLE_FMT_S16);
+      if(ao){
+        audio_running = true;
+        audio_data = new audio_thread_data{raw_ncv, ao, &audio_running, &audio_mutex};
+        audio_thread = new std::thread(audio_thread_func, audio_data);
+        audio_output_start(ao);
+      }
+    }
+
     do{
       struct marshal marsh = {
         .framecount = 0,
@@ -366,6 +491,22 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .blitter = vopts.blitter,
       };
       r = ncv->stream(&vopts, timescale, perframe, &marsh);
+      // Stop audio thread
+      if(audio_thread){
+        audio_running = false;
+        audio_thread->join();
+        delete audio_thread;
+        audio_thread = nullptr;
+      }
+      if(audio_data){
+        delete audio_data;
+        audio_data = nullptr;
+      }
+      if(ao){
+        audio_output_destroy(ao);
+        ao = nullptr;
+      }
+
       free(stdn->get_userptr());
       stdn->set_userptr(nullptr);
       if(r == 0){
@@ -425,6 +566,21 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
   return 0;
 
 err:
+  // Cleanup audio resources
+  if(audio_thread){
+    audio_running = false;
+    audio_thread->join();
+    delete audio_thread;
+    audio_thread = nullptr;
+  }
+  if(audio_data){
+    delete audio_data;
+    audio_data = nullptr;
+  }
+  if(ao){
+    audio_output_destroy(ao);
+    ao = nullptr;
+  }
   free(ncplane_userptr(n));
   ncplane_destroy(n);
   return -1;
