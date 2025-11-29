@@ -1194,10 +1194,7 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
     pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
     // Need more packets - video decoder will provide them
     // This is normal - the decoder needs more packets before it can produce a frame
-    if(receive_call_count <= 20 || receive_call_count % 200 == 0){
-      audio_log("ffmpeg_get_decoded_audio_frame: EAGAIN (call %d, packet_outstanding=%d, pending=%d)\n",
-                receive_call_count, (int)outstanding, pending_after);
-    }
+    (void)outstanding;
     return 0;
   }else if(averr == AVERROR_EOF){
     pthread_mutex_unlock(&ncv->details->audio_packet_mutex);

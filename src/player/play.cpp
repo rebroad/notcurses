@@ -97,8 +97,10 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_video_log).count();
     if(elapsed >= 1000){
       double fps = (elapsed > 0) ? (video_frames_since_log * 1000.0 / elapsed) : 0.0;
-      audio_log("Video thread: FPS=%.2f (frame=%d, drops=%" PRIu64 ")\n",
-                fps, marsh->framecount, marsh->dropped_frames);
+      uint64_t total_attempted = marsh->framecount + marsh->dropped_frames;
+      double drop_pct = total_attempted ? (100.0 * marsh->dropped_frames / total_attempted) : 0.0;
+      audio_log("Video thread: FPS=%.2f (frame=%d, drops=%" PRIu64 " = %.1f%%)\n",
+                fps, marsh->framecount, marsh->dropped_frames, drop_pct);
       video_frames_since_log = 0;
       last_video_log = now;
     }
@@ -497,8 +499,9 @@ static void audio_thread_func(audio_thread_data* data) {
       break;
     }else{
       consecutive_eagain++;
-      if(frame_count <= 30 || consecutive_eagain % 50 == 0){
-        audio_log("Audio thread: No frame available (EAGAIN), frame_count=%d, consecutive=%d\n", frame_count, consecutive_eagain);
+      if(frame_count <= 5 && consecutive_eagain % 1000 == 0){
+        audio_log("Audio thread: Waiting for audio frames (frame_count=%d, consecutive=%d)\n",
+                  frame_count, consecutive_eagain);
       }
       ffmpeg_audio_request_packets(ncv);
       if(!audio_output_needs_data(ao)){
