@@ -34,6 +34,8 @@ API void audio_output_destroy(audio_output* ao);
 API audio_output* audio_output_get_global(void);
 // Check if audio buffer needs more data (returns true if buffer is less than 50% full)
 API bool audio_output_needs_data(audio_output* ao);
+API int audio_output_get_sample_rate(audio_output* ao);
+API int audio_output_get_channels(audio_output* ao);
 
 #ifdef __cplusplus
 }

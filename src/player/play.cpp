@@ -15,6 +15,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/packet.h>
@@ -67,6 +68,8 @@ struct marshal {
   ncblitter_e blitter; // can be changed while streaming, must propagate out
 };
 
+static void audio_log(const char* fmt, ...);
+
 // frame count is in the curry. original time is kept in n's userptr.
 auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
               const struct timespec* abstime, void* vmarshal) -> int {
@@ -80,9 +83,20 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     ncplane_set_userptr(vopts->n, start);
   }
   std::unique_ptr<Plane> stdn(nc.get_stdplane());
+  static auto last_video_log = std::chrono::steady_clock::now();
+  static int video_frames_since_log = 0;
   // negative framecount means don't print framecount/timing (quiet mode)
   if(marsh->framecount >= 0){
     ++marsh->framecount;
+    video_frames_since_log++;
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_video_log).count();
+    if(elapsed >= 1000){
+      double fps = (elapsed > 0) ? (video_frames_since_log * 1000.0 / elapsed) : 0.0;
+      audio_log("Video thread: FPS=%.2f (frame=%d)\n", fps, marsh->framecount);
+      video_frames_since_log = 0;
+      last_video_log = now;
+    }
   }
   stdn->set_fg_rgb(0x80c080);
   struct timespec now;
@@ -361,16 +375,23 @@ static void audio_thread_func(audio_thread_data* data) {
     return;
   }
 
-  // Initialize resampler - convert FROM codec format TO fixed output format
-  // Output format: 44100Hz, stereo (or mono), S16
-  int out_sample_rate = 44100; // Fixed output sample rate
-  int out_channels = ffmpeg_get_audio_channels(ncv);
+  // Initialize resampler - convert FROM codec format TO output format
+  int out_sample_rate = audio_output_get_sample_rate(ao);
+  if(out_sample_rate <= 0){
+    out_sample_rate = 44100;
+  }
+  int out_channels = audio_output_get_channels(ao);
+  if(out_channels <= 0){
+    out_channels = ffmpeg_get_audio_channels(ncv);
+  }
   // Limit to stereo max for output
   if(out_channels > 2){
     out_channels = 2;
   }
 
-  audio_log("Audio thread: Initializing resampler: %d Hz, %d channels\n", out_sample_rate, out_channels);
+  audio_log("Audio thread: Initializing resampler: %d Hz, %d channels (hw rate=%d, hw channels=%d)\n",
+            out_sample_rate, out_channels, audio_output_get_sample_rate(ao),
+            audio_output_get_channels(ao));
 
   if(ffmpeg_init_audio_resampler(ncv, out_sample_rate, out_channels) < 0){
     audio_log("Audio thread: Failed to initialize audio resampler\n");
@@ -381,6 +402,8 @@ static void audio_thread_func(audio_thread_data* data) {
 
   int frame_count = 0;
   int consecutive_eagain = 0;
+  auto last_log = std::chrono::steady_clock::now();
+  int frames_since_log = 0;
   while(*running){
     // Get decoded audio frame (packets are read by video decoder)
     // IMPORTANT: avcodec_receive_frame can only return each frame once
@@ -398,8 +421,16 @@ static void audio_thread_func(audio_thread_data* data) {
         // Always write - audio_output_write will handle buffer management
         audio_output_write(ao, out_data, bytes);
         frame_count++;
+        frames_since_log++;
         if(frame_count <= 30 || frame_count % 100 == 0){
           audio_log("Audio thread: Processed frame %d, samples=%d, bytes=%d\n", frame_count, samples, bytes);
+        }
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count();
+        if(elapsed >= 1000){
+          audio_log("Audio thread: last second frames=%d (frame_count=%d)\n", frames_since_log, frame_count);
+          frames_since_log = 0;
+          last_log = now;
         }
         free(out_data);
       }else{

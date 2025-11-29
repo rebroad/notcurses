@@ -1141,16 +1141,24 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
   // This will only return a frame once per packet - subsequent calls return EAGAIN
   static int receive_call_count = 0;
   receive_call_count++;
+  int pending_after = 0;
+  bool outstanding = false;
+  pthread_mutex_lock(&ncv->details->audio_packet_mutex);
   int averr = avcodec_receive_frame(ncv->details->audiocodecctx, ncv->details->audio_frame);
+  pending_after = ncv->details->pending_audio_packets.count;
+  outstanding = ncv->details->audio_packet_outstanding;
   if(averr == 0){
-    // When we successfully receive a frame, the decoder now has room for more packets
-    pthread_mutex_lock(&ncv->details->audio_packet_mutex);
-    ffmpeg_drain_pending_audio_locked(ncv->details);
-    int pending_after = ncv->details->pending_audio_packets.count;
+    static int frame_counter = 0;
+    frame_counter++;
+    if(pending_after == 0){
+      ncv->details->audio_packet_outstanding = false;
+      outstanding = false;
+    }
     pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
-    if(receive_call_count <= 20 || receive_call_count % 100 == 0){
-      audio_log("ffmpeg_get_decoded_audio_frame: Frame received, pending queue=%d (call %d)\n",
-                pending_after, receive_call_count);
+    if(receive_call_count <= 20 || receive_call_count % 100 == 0 ||
+       frame_counter % 50 == 0){
+      audio_log("ffmpeg_get_decoded_audio_frame: Frame received, pending queue=%d, total_frames=%d\n",
+                pending_after, frame_counter);
     }
 
     // Check if this is a new frame (different PTS) or the same one we already processed
@@ -1172,26 +1180,20 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
     }
     return ncv->details->audio_frame->nb_samples;
   }else if(averr == AVERROR(EAGAIN)){
-    // Need more packets - try to send any pending packet
-    // Even though receive_frame returned EAGAIN, the decoder might have made room
-    // for a new packet (it processes packets asynchronously)
-    pthread_mutex_lock(&ncv->details->audio_packet_mutex);
-    ffmpeg_drain_pending_audio_locked(ncv->details);
-    int pending_after = ncv->details->pending_audio_packets.count;
     pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
-
     // Need more packets - video decoder will provide them
     // This is normal - the decoder needs more packets before it can produce a frame
     if(receive_call_count <= 20 || receive_call_count % 100 == 0){
       audio_log("ffmpeg_get_decoded_audio_frame: EAGAIN (call %d, packet_outstanding=%d, pending=%d)\n",
-                receive_call_count, (int)ncv->details->audio_packet_outstanding,
-                pending_after);
+                receive_call_count, (int)outstanding, pending_after);
     }
     return 0;
   }else if(averr == AVERROR_EOF){
+    pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
     audio_log("ffmpeg_get_decoded_audio_frame: EOF (call %d)\n", receive_call_count);
     return 1; // EOF
   }else{
+    pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
     audio_log("ffmpeg_get_decoded_audio_frame: Error %d (call %d)\n", averr, receive_call_count);
     return -1; // Error
   }

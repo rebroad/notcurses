@@ -380,5 +380,21 @@ API bool audio_output_needs_data(audio_output* ao) {
   return needs_data;
 }
 
+API int audio_output_get_sample_rate(audio_output* ao) {
+  if (!ao) return 0;
+  pthread_mutex_lock(&ao->mutex);
+  int rate = ao->sample_rate;
+  pthread_mutex_unlock(&ao->mutex);
+  return rate;
+}
+
+API int audio_output_get_channels(audio_output* ao) {
+  if (!ao) return 0;
+  pthread_mutex_lock(&ao->mutex);
+  int ch = ao->channels;
+  pthread_mutex_unlock(&ao->mutex);
+  return ch;
+}
+
 #endif // USE_FFMPEG
 
