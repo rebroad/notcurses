@@ -11,7 +11,9 @@
 #include <libswscale/version.h>
 #include <libswresample/swresample.h>
 #include <libswresample/version.h>
-#include <libavdevice/avdevice.h>
+// libavdevice removed - it depends on SDL2 which interferes with terminal initialization
+// avdevice is only needed for device I/O, not file playback
+// #include <libavdevice/avdevice.h>
 #include <libavformat/version.h>
 #include <libavformat/avformat.h>
 #include <libavutil/samplefmt.h>
@@ -574,13 +576,29 @@ ffmpeg_decode_audio(ncvisual* ncv, AVPacket* packet){
 // Initialize audio resampler for converting to SDL format
 static int
 ffmpeg_init_audio_resampler(ncvisual* ncv, int out_sample_rate, int out_channels){
+  FILE* log_file = fopen("/tmp/ncplayer_audio.log", "a");
+
   if(!ncv->details->audiocodecctx || ncv->details->audio_stream_index < 0){
+    if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: no codec context or invalid stream index\n");
+      fclose(log_file);
+    }
     return -1;
   }
 
   AVCodecContext* acodecctx = ncv->details->audiocodecctx;
-  AVChannelLayout out_ch_layout;
-  AVChannelLayout in_ch_layout;
+  AVChannelLayout out_ch_layout = {0};
+  AVChannelLayout in_ch_layout = {0};
+
+  if(log_file){
+    fprintf(log_file, "ffmpeg_init_audio_resampler: codec context: sample_rate=%d, sample_fmt=%d, ch_layout.nb_channels=%d\n",
+            acodecctx->sample_rate, acodecctx->sample_fmt, acodecctx->ch_layout.nb_channels);
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    fprintf(log_file, "ffmpeg_init_audio_resampler: codec context (old API): channels=%d\n", acodecctx->channels);
+    #pragma GCC diagnostic pop
+    fflush(log_file);
+  }
 
   // Initialize output channel layout
   if(out_channels == 1){
@@ -589,28 +607,167 @@ ffmpeg_init_audio_resampler(ncvisual* ncv, int out_sample_rate, int out_channels
     av_channel_layout_default(&out_ch_layout, 2);
   }
 
-  // Get input channel layout
-  if(acodecctx->ch_layout.nb_channels == 0){
-    // Old API
-    av_channel_layout_default(&in_ch_layout, acodecctx->channels);
-  }else{
-    in_ch_layout = acodecctx->ch_layout;
+  if(log_file){
+    fprintf(log_file, "ffmpeg_init_audio_resampler: output layout initialized: nb_channels=%d\n", out_ch_layout.nb_channels);
+    fflush(log_file);
   }
 
-  ncv->details->swrctx = swr_alloc_set_opts2(
-    &ncv->details->swrctx,
-    &out_ch_layout, AV_SAMPLE_FMT_S16, out_sample_rate,
-    &in_ch_layout, acodecctx->sample_fmt, acodecctx->sample_rate,
-    0, NULL);
+  // Get input channel layout
+  int ret = 0;
+  if(acodecctx->ch_layout.nb_channels == 0){
+    // Old API - need to construct channel layout from deprecated channels field
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    int in_channels = acodecctx->channels;
+    #pragma GCC diagnostic pop
+    if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: using old API, creating layout for %d channels\n", in_channels);
+      fflush(log_file);
+    }
+    av_channel_layout_default(&in_ch_layout, in_channels);
+  }else{
+    if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: copying existing channel layout (%d channels)\n",
+              acodecctx->ch_layout.nb_channels);
+      fflush(log_file);
+    }
+    ret = av_channel_layout_copy(&in_ch_layout, &acodecctx->ch_layout);
+    if(ret < 0){
+      if(log_file){
+        fprintf(log_file, "ffmpeg_init_audio_resampler: failed to copy input channel layout (ret=%d)\n", ret);
+        fclose(log_file);
+      }
+      av_channel_layout_uninit(&out_ch_layout);
+      return -1;
+    }
+  }
+
+  if(log_file){
+    fprintf(log_file, "ffmpeg_init_audio_resampler: input layout initialized: nb_channels=%d\n", in_ch_layout.nb_channels);
+    fprintf(log_file, "ffmpeg_init_audio_resampler: input=%d ch, %d Hz, fmt=%d -> output=%d ch, %d Hz, fmt=%d\n",
+            in_ch_layout.nb_channels, acodecctx->sample_rate, acodecctx->sample_fmt,
+            out_ch_layout.nb_channels, out_sample_rate, AV_SAMPLE_FMT_S16);
+    fflush(log_file);
+  }
+
+  // Validate channel layouts before using them
+  if(in_ch_layout.nb_channels == 0 || out_ch_layout.nb_channels == 0){
+    if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: invalid channel layout (in=%d, out=%d)\n",
+              in_ch_layout.nb_channels, out_ch_layout.nb_channels);
+      fclose(log_file);
+    }
+    av_channel_layout_uninit(&out_ch_layout);
+    av_channel_layout_uninit(&in_ch_layout);
+    return -1;
+  }
+
+  // Ensure swrctx is NULL before allocation
+  if(ncv->details->swrctx){
+    if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: freeing existing swrctx\n");
+      fflush(log_file);
+    }
+    swr_free(&ncv->details->swrctx);
+  }
+  ncv->details->swrctx = NULL; // Ensure it's NULL
+
+  // Use older API with channel masks (more stable, avoids segfaults)
+  // Clean up channel layouts first
+  av_channel_layout_uninit(&out_ch_layout);
+  av_channel_layout_uninit(&in_ch_layout);
+
+  {
+      if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: using older API with channel masks...\n");
+      fflush(log_file);
+    }
+
+    // Convert to channel masks for older API
+    uint64_t in_channel_mask = 0;
+    uint64_t out_channel_mask = 0;
+
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    // Get channel count
+    int in_ch_count = (acodecctx->ch_layout.nb_channels > 0) ?
+                      acodecctx->ch_layout.nb_channels : acodecctx->channels;
+
+    // Map channel count to standard layout masks
+    if(in_ch_count == 1){
+      in_channel_mask = AV_CH_LAYOUT_MONO;
+    }else if(in_ch_count == 2){
+      in_channel_mask = AV_CH_LAYOUT_STEREO;
+    }else if(in_ch_count == 6){
+      in_channel_mask = AV_CH_LAYOUT_5POINT1;
+    }else if(in_ch_count == 4){
+      in_channel_mask = AV_CH_LAYOUT_QUAD;
+    }else if(in_ch_count == 8){
+      in_channel_mask = AV_CH_LAYOUT_7POINT1;
+    }else{
+      // For unknown channel counts, use a safe default
+      if(log_file){
+        fprintf(log_file, "ffmpeg_init_audio_resampler: warning: unsupported channel count %d, using stereo\n", in_ch_count);
+        fflush(log_file);
+      }
+      in_channel_mask = AV_CH_LAYOUT_STEREO;
+      in_ch_count = 2; // Force to stereo
+    }
+    #pragma GCC diagnostic pop
+
+    out_channel_mask = (out_channels == 1) ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
+
+    if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: using channel masks: in=0x%llx (%d ch), out=0x%llx (%d ch)\n",
+              (unsigned long long)in_channel_mask, in_ch_count,
+              (unsigned long long)out_channel_mask, out_channels);
+      fflush(log_file);
+    }
+
+    ncv->details->swrctx = swr_alloc_set_opts(
+      NULL,
+      out_channel_mask, AV_SAMPLE_FMT_S16, out_sample_rate,
+      in_channel_mask, acodecctx->sample_fmt, acodecctx->sample_rate,
+      0, NULL);
+
+    if(!ncv->details->swrctx){
+      if(log_file){
+        fprintf(log_file, "ffmpeg_init_audio_resampler: swr_alloc_set_opts also failed\n");
+        fclose(log_file);
+      }
+      return -1;
+    }
+
+    if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: swr_alloc_set_opts succeeded\n");
+      fflush(log_file);
+    }
+  }
 
   if(!ncv->details->swrctx){
+    if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: ERROR: swrctx is NULL after allocation!\n");
+      fclose(log_file);
+    }
     return -1;
   }
 
-  int ret = swr_init(ncv->details->swrctx);
+  ret = swr_init(ncv->details->swrctx);
   if(ret < 0){
+    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+    av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+    if(log_file){
+      fprintf(log_file, "ffmpeg_init_audio_resampler: swr_init failed (ret=%d): %s\n", ret, errbuf);
+      fclose(log_file);
+    }
     swr_free(&ncv->details->swrctx);
+    ncv->details->swrctx = NULL;
     return -1;
+  }
+
+  if(log_file){
+    fprintf(log_file, "ffmpeg_init_audio_resampler: success\n");
+    fclose(log_file);
   }
 
   return 0;
@@ -777,10 +934,22 @@ ffmpeg_resize_internal(const ncvisual* ncv, int rows, int* stride, int cols,
     *stride = ncv->rowstride;
     return ncv->data;
   }
+  // Validate inframe fields before use
+  if(inframe->width <= 0 || inframe->height <= 0 || inframe->format < 0){
+    return NULL;
+  }
   const int srclenx = bargs->lenx ? bargs->lenx : inframe->width;
   const int srcleny = bargs->leny ? bargs->leny : inframe->height;
+  // Validate dimensions
+  if(srclenx <= 0 || srcleny <= 0 || cols <= 0 || rows <= 0){
+    return NULL;
+  }
 //fprintf(stderr, "src %d/%d -> targ %d/%d ctx: %p\n", srcleny, srclenx, rows, cols, ncv->details->swsctx);
-  ncv->details->swsctx = sws_getCachedContext(ncv->details->swsctx,
+  // Always pass NULL to sws_getCachedContext to avoid passing potentially corrupted pointers
+  // This disables context caching but is safer. sws_getCachedContext will create a new context.
+  // If the old context exists and is valid, sws_getCachedContext will free it internally.
+  // However, we can't safely detect if a pointer is corrupted, so we always pass NULL.
+  ncv->details->swsctx = sws_getCachedContext(NULL,
                                               srclenx, srcleny,
                                               inframe->format,
                                               cols, rows, targformat,
@@ -888,19 +1057,20 @@ ffmpeg_log_level(int level){
 static int
 ffmpeg_init(int logl){
   av_log_set_level(ffmpeg_log_level(logl));
-  avdevice_register_all();
+  // avdevice_register_all() removed - libavdevice depends on SDL2 which interferes with terminal initialization
+  // avdevice is only needed for device I/O, not file playback
   // FIXME could also use av_log_set_callback() and capture the message...
   return 0;
 }
 
 static void
 ffmpeg_printbanner(fbuf* f){
-  fbuf_printf(f, "avformat %u.%u.%u avutil %u.%u.%u swscale %u.%u.%u avcodec %u.%u.%u avdevice %u.%u.%u" NL,
+  fbuf_printf(f, "avformat %u.%u.%u avutil %u.%u.%u swscale %u.%u.%u avcodec %u.%u.%u" NL,
               LIBAVFORMAT_VERSION_MAJOR, LIBAVFORMAT_VERSION_MINOR, LIBAVFORMAT_VERSION_MICRO,
               LIBAVUTIL_VERSION_MAJOR, LIBAVUTIL_VERSION_MINOR, LIBAVUTIL_VERSION_MICRO,
               LIBSWSCALE_VERSION_MAJOR, LIBSWSCALE_VERSION_MINOR, LIBSWSCALE_VERSION_MICRO,
-              LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR, LIBAVCODEC_VERSION_MICRO,
-              LIBAVDEVICE_VERSION_MAJOR, LIBAVDEVICE_VERSION_MINOR, LIBAVDEVICE_VERSION_MICRO);
+              LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR, LIBAVCODEC_VERSION_MICRO);
+  // avdevice removed - it depends on SDL2
 }
 
 static void

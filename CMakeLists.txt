@@ -323,6 +323,9 @@ endif()
 ############################################################################
 # libnotcurses (multimedia shared library+static library)
 file(GLOB NCSRCS CONFIGURE_DEPENDS src/media/*.c src/media/*.cpp)
+# Exclude audio-output.c from libnotcurses to avoid SDL2 being loaded at library load time
+# audio-output.c will be compiled separately for ncplayer only
+list(REMOVE_ITEM NCSRCS "${CMAKE_SOURCE_DIR}/src/media/audio-output.c")
 add_library(notcurses SHARED ${NCSRCS} ${COMPATSRC})
 if(${USE_STATIC})
 # can't build binaries against static notcurses until ffmpeg linking issues
@@ -377,61 +380,65 @@ if(${USE_FFMPEG})
 target_include_directories(notcurses
   PRIVATE
     "${AVCODEC_INCLUDE_DIRS}"
-    "${AVDEVICE_INCLUDE_DIRS}"
+    # AVDEVICE removed - it depends on SDL2, which interferes with terminal initialization
+    # AVDEVICE is only needed for device I/O, not file playback
     "${AVFORMAT_INCLUDE_DIRS}"
     "${AVUTIL_INCLUDE_DIRS}"
     "${SWSCALE_INCLUDE_DIRS}"
     "${SWRESAMPLE_INCLUDE_DIRS}"
-    "${SDL2_INCLUDE_DIRS}"
+    # SDL2 headers not needed here - audio-output.c handles SDL2 separately
 )
 target_include_directories(notcurses-static
   PRIVATE
     "${AVCODEC_STATIC_INCLUDE_DIRS}"
-    "${AVDEVICE_STATIC_INCLUDE_DIRS}"
+    # AVDEVICE removed - it depends on SDL2, which interferes with terminal initialization
+    # AVDEVICE is only needed for device I/O, not file playback
     "${AVFORMAT_STATIC_INCLUDE_DIRS}"
     "${AVUTIL_STATIC_INCLUDE_DIRS}"
     "${SWSCALE_STATIC_INCLUDE_DIRS}"
     "${SWRESAMPLE_STATIC_INCLUDE_DIRS}"
-    "${SDL2_INCLUDE_DIRS}"
+    # SDL2 headers not needed here - audio-output.c handles SDL2 separately
 )
 target_link_libraries(notcurses
   PRIVATE
     "${AVCODEC_LIBRARIES}"
-    "${AVDEVICE_LIBRARIES}"
+    # AVDEVICE removed - it depends on SDL2, which interferes with terminal initialization
+    # AVDEVICE is only needed for device I/O, not file playback
     "${AVFORMAT_LIBRARIES}"
     "${SWSCALE_LIBRARIES}"
     "${AVUTIL_LIBRARIES}"
     "${SWRESAMPLE_LIBRARIES}"
-    "${SDL2_LIBRARIES}"
+    # SDL2 is only linked to ncplayer, not here, to avoid interference with terminal initialization
 )
 target_link_libraries(notcurses-static
   PRIVATE
     "${AVCODEC_STATIC_LIBRARIES}"
-    "${AVDEVICE_STATIC_LIBRARIES}"
+    # AVDEVICE removed - it depends on SDL2, which interferes with terminal initialization
+    # AVDEVICE is only needed for device I/O, not file playback
     "${AVFORMAT_STATIC_LIBRARIES}"
     "${SWSCALE_STATIC_LIBRARIES}"
     "${AVUTIL_STATIC_LIBRARIES}"
     "${SWRESAMPLE_STATIC_LIBRARIES}"
-    "${SDL2_LIBRARIES}"
+    # SDL2 is only linked to ncplayer, not here, to avoid interference with terminal initialization
 )
 target_link_directories(notcurses
   PRIVATE
     "${AVCODEC_LIBRARY_DIRS}"
-    "${AVDEVICE_LIBRARY_DIRS}"
+    # AVDEVICE removed - it depends on SDL2
     "${AVFORMAT_LIBRARY_DIRS}"
     "${SWSCALE_LIBRARY_DIRS}"
     "${AVUTIL_LIBRARY_DIRS}"
     "${SWRESAMPLE_LIBRARY_DIRS}"
-    "${SDL2_LIBRARY_DIRS}"
+    # SDL2 library dirs only for ncplayer
 )
 target_link_directories(notcurses-static
   PRIVATE
     "${AVCODEC_STATIC_LIBRARY_DIRS}"
-    "${AVDEVICE_STATIC_LIBRARY_DIRS}"
+    # AVDEVICE removed - it depends on SDL2
     "${AVFORMAT_STATIC_LIBRARY_DIRS}"
     "${SWSCALE_STATIC_LIBRARY_DIRS}"
     "${SWRESAMPLE_STATIC_LIBRARY_DIRS}"
-    "${SDL2_LIBRARY_DIRS}"
+    # SDL2 library dirs only for ncplayer
     "${AVUTIL_STATIC_LIBRARY_DIRS}"
 )
 elseif(${USE_OIIO})
@@ -875,13 +882,17 @@ target_include_directories(ncplayer
     "${SWRESAMPLE_INCLUDE_DIRS}"
     "${SDL2_INCLUDE_DIRS}"
 )
+# Compile audio-output.c only for ncplayer (not for libnotcurses)
+# This prevents SDL2 from being loaded when libnotcurses.so loads
+target_sources(ncplayer PRIVATE "${CMAKE_SOURCE_DIR}/src/media/audio-output.c")
 target_link_libraries(ncplayer
   PRIVATE
     "${AVCODEC_LIBRARIES}"
     "${AVFORMAT_LIBRARIES}"
     "${AVUTIL_LIBRARIES}"
     "${SWRESAMPLE_LIBRARIES}"
-    "${SDL2_LIBRARIES}"
+    # SDL2 is loaded dynamically via dlopen to avoid loading at program startup
+    # This prevents SDL2 from interfering with terminal initialization
 )
 endif()
 target_link_libraries(ncplayer
@@ -894,6 +905,8 @@ set_target_properties(ncplayer PROPERTIES
   BUILD_RPATH "${CMAKE_BINARY_DIR}"
   INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}"
 )
+# Treat warnings as errors for ncplayer
+target_compile_options(ncplayer PRIVATE -Werror)
 endif()
 endif()
 else()

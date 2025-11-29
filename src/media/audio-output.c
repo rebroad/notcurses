@@ -5,9 +5,10 @@
 #include <libavutil/frame.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/samplefmt.h>
-#include <SDL2/SDL.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include "lib/internal.h"
@@ -19,6 +20,39 @@
 #endif
 
 #define AUDIO_BUFFER_SIZE 4096
+
+// SDL2 types - defined locally to avoid including SDL2/SDL.h (which would cause SDL2 to be linked)
+typedef uint32_t SDL_AudioDeviceID;
+typedef struct SDL_AudioSpec {
+  int freq;
+  uint16_t format;
+  uint8_t channels;
+  uint8_t silence;
+  uint16_t samples;
+  uint16_t padding;
+  uint32_t size;
+  void (*callback)(void* userdata, uint8_t* stream, int len);
+  void* userdata;
+} SDL_AudioSpec;
+
+#define SDL_INIT_AUDIO 0x00000010
+#define SDL_AUDIO_ALLOW_FREQUENCY_CHANGE 0x00000001
+#define SDL_AUDIO_ALLOW_CHANNELS_CHANGE 0x00000002
+#define AUDIO_S16SYS 0x8010
+
+// SDL2 function pointers - loaded dynamically to avoid loading SDL2 at library load time
+typedef struct {
+  void* handle;
+  int (*SDL_Init)(uint32_t);
+  void (*SDL_QuitSubSystem)(uint32_t);
+  const char* (*SDL_GetError)(void);
+  SDL_AudioDeviceID (*SDL_OpenAudioDevice)(const char*, int, const SDL_AudioSpec*, SDL_AudioSpec*, int);
+  void (*SDL_PauseAudioDevice)(SDL_AudioDeviceID, int);
+  void (*SDL_CloseAudioDevice)(SDL_AudioDeviceID);
+  int (*SDL_SetHint)(const char*, const char*);
+} sdl2_functions;
+
+static sdl2_functions sdl2 = {0};
 
 typedef struct audio_output {
   SDL_AudioDeviceID device_id;
@@ -40,6 +74,7 @@ typedef struct audio_output {
 } audio_output;
 
 static audio_output* g_audio = NULL;
+static bool sdl_initialized = false;
 
 static void audio_callback(void* userdata, uint8_t* stream, int len) {
   audio_output* ao = (audio_output*)userdata;
@@ -89,10 +124,59 @@ static void audio_callback(void* userdata, uint8_t* stream, int len) {
   }
 }
 
+// Load SDL2 dynamically to avoid loading it at program startup
+static int load_sdl2(void) {
+  if (sdl2.handle) {
+    return 0; // Already loaded
+  }
+
+  sdl2.handle = dlopen("libSDL2-2.0.so.0", RTLD_LAZY);
+  if (!sdl2.handle) {
+    sdl2.handle = dlopen("libSDL2.so", RTLD_LAZY);
+  }
+  if (!sdl2.handle) {
+    logerror("Failed to load SDL2: %s", dlerror());
+    return -1;
+  }
+
+  // Load SDL2 functions
+  sdl2.SDL_SetHint = (int (*)(const char*, const char*))dlsym(sdl2.handle, "SDL_SetHint");
+  sdl2.SDL_Init = (int (*)(uint32_t))dlsym(sdl2.handle, "SDL_Init");
+  sdl2.SDL_GetError = (const char* (*)(void))dlsym(sdl2.handle, "SDL_GetError");
+  sdl2.SDL_OpenAudioDevice = (SDL_AudioDeviceID (*)(const char*, int, const SDL_AudioSpec*, SDL_AudioSpec*, int))dlsym(sdl2.handle, "SDL_OpenAudioDevice");
+  sdl2.SDL_PauseAudioDevice = (void (*)(SDL_AudioDeviceID, int))dlsym(sdl2.handle, "SDL_PauseAudioDevice");
+  sdl2.SDL_CloseAudioDevice = (void (*)(SDL_AudioDeviceID))dlsym(sdl2.handle, "SDL_CloseAudioDevice");
+  sdl2.SDL_QuitSubSystem = (void (*)(uint32_t))dlsym(sdl2.handle, "SDL_QuitSubSystem");
+
+  if (!sdl2.SDL_Init || !sdl2.SDL_GetError || !sdl2.SDL_OpenAudioDevice ||
+      !sdl2.SDL_PauseAudioDevice || !sdl2.SDL_CloseAudioDevice || !sdl2.SDL_QuitSubSystem) {
+    logerror("Failed to load SDL2 functions: %s", dlerror());
+    dlclose(sdl2.handle);
+    sdl2.handle = NULL;
+    return -1;
+  }
+
+  return 0;
+}
+
 API audio_output* audio_output_init(int sample_rate, int channels, int sample_fmt) {
-  if (SDL_Init(SDL_INIT_AUDIO) < 0) {
-    logerror("SDL audio init failed: %s", SDL_GetError());
+  // Load SDL2 dynamically (only when audio is actually needed)
+  if (load_sdl2() < 0) {
     return NULL;
+  }
+
+  // Initialize SDL2 audio subsystem only once
+  // Use SDL_INIT_AUDIO only (not SDL_INIT_EVERYTHING) to avoid interfering with terminal
+  if (!sdl_initialized) {
+    // Don't let SDL2 install signal handlers that might interfere with terminal
+    if (sdl2.SDL_SetHint) {
+      sdl2.SDL_SetHint("SDL_HINT_NO_SIGNAL_HANDLERS", "1");
+    }
+    if (sdl2.SDL_Init(SDL_INIT_AUDIO) < 0) {
+      logerror("SDL audio init failed: %s", sdl2.SDL_GetError());
+      return NULL;
+    }
+    sdl_initialized = true;
   }
 
   audio_output* ao = calloc(1, sizeof(audio_output));
@@ -104,7 +188,7 @@ API audio_output* audio_output_init(int sample_rate, int channels, int sample_fm
   ao->channels = channels;
   ao->sample_fmt = sample_fmt;
 
-  SDL_memset(&ao->want_spec, 0, sizeof(ao->want_spec));
+  memset(&ao->want_spec, 0, sizeof(ao->want_spec));
   ao->want_spec.freq = sample_rate;
   ao->want_spec.format = AUDIO_S16SYS;  // Signed 16-bit samples, system byte order
   ao->want_spec.channels = channels;
@@ -112,12 +196,12 @@ API audio_output* audio_output_init(int sample_rate, int channels, int sample_fm
   ao->want_spec.callback = audio_callback;
   ao->want_spec.userdata = ao;
 
-  ao->device_id = SDL_OpenAudioDevice(NULL, 0, &ao->want_spec, &ao->have_spec,
+  ao->device_id = sdl2.SDL_OpenAudioDevice(NULL, 0, &ao->want_spec, &ao->have_spec,
                                       SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_CHANNELS_CHANGE);
   if (ao->device_id == 0) {
-    logerror("SDL_OpenAudioDevice failed: %s", SDL_GetError());
+    logerror("SDL_OpenAudioDevice failed: %s", sdl2.SDL_GetError());
     free(ao);
-    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    sdl2.SDL_QuitSubSystem(SDL_INIT_AUDIO);
     return NULL;
   }
 
@@ -128,14 +212,14 @@ API audio_output* audio_output_init(int sample_rate, int channels, int sample_fm
   ao->buffer_size = sample_rate * channels * sizeof(int16_t) * 2; // 2 seconds buffer
   ao->buffer = malloc(ao->buffer_size);
   if (!ao->buffer) {
-    SDL_CloseAudioDevice(ao->device_id);
+    sdl2.SDL_CloseAudioDevice(ao->device_id);
     free(ao);
     return NULL;
   }
 
   if (pthread_mutex_init(&ao->mutex, NULL) != 0) {
     free(ao->buffer);
-    SDL_CloseAudioDevice(ao->device_id);
+    sdl2.SDL_CloseAudioDevice(ao->device_id);
     free(ao);
     return NULL;
   }
@@ -143,7 +227,7 @@ API audio_output* audio_output_init(int sample_rate, int channels, int sample_fm
   if (pthread_cond_init(&ao->cond, NULL) != 0) {
     pthread_mutex_destroy(&ao->mutex);
     free(ao->buffer);
-    SDL_CloseAudioDevice(ao->device_id);
+    sdl2.SDL_CloseAudioDevice(ao->device_id);
     free(ao);
     return NULL;
   }
@@ -162,19 +246,19 @@ API void audio_output_start(audio_output* ao) {
   if (!ao) return;
   ao->playing = true;
   ao->paused = false;
-  SDL_PauseAudioDevice(ao->device_id, 0);
+  sdl2.SDL_PauseAudioDevice(ao->device_id, 0);
 }
 
 API void audio_output_pause(audio_output* ao) {
   if (!ao) return;
   ao->paused = true;
-  SDL_PauseAudioDevice(ao->device_id, 1);
+  sdl2.SDL_PauseAudioDevice(ao->device_id, 1);
 }
 
 API void audio_output_resume(audio_output* ao) {
   if (!ao) return;
   ao->paused = false;
-  SDL_PauseAudioDevice(ao->device_id, 0);
+  sdl2.SDL_PauseAudioDevice(ao->device_id, 0);
 }
 
 API int audio_output_write(audio_output* ao, const uint8_t* data, size_t len) {
@@ -229,7 +313,7 @@ API void audio_output_destroy(audio_output* ao) {
   ao->playing = false;
   pthread_cond_broadcast(&ao->cond);
 
-  SDL_CloseAudioDevice(ao->device_id);
+  sdl2.SDL_CloseAudioDevice(ao->device_id);
   pthread_mutex_destroy(&ao->mutex);
   pthread_cond_destroy(&ao->cond);
   free(ao->buffer);
@@ -239,7 +323,14 @@ API void audio_output_destroy(audio_output* ao) {
     g_audio = NULL;
   }
 
-  SDL_QuitSubSystem(SDL_INIT_AUDIO);
+  // Don't quit SDL subsystem here - it might be used by other instances
+  // Only quit if this was the last instance
+  if (g_audio == NULL && sdl2.handle) {
+    sdl2.SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    sdl_initialized = false;
+    dlclose(sdl2.handle);
+    memset(&sdl2, 0, sizeof(sdl2));
+  }
 }
 
 API audio_output* audio_output_get_global(void) {

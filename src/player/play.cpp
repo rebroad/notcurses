@@ -13,7 +13,40 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <cstdio>
+#include <cstdarg>
 #include "builddef.h"
+
+#ifdef USE_FFMPEG
+static FILE* audio_log_file = nullptr;
+
+static void audio_log_init(void){
+  if(!audio_log_file){
+    audio_log_file = fopen("/tmp/ncplayer_audio.log", "w");
+    if(audio_log_file){
+      fprintf(audio_log_file, "=== Audio debug log ===\n");
+      fflush(audio_log_file);
+    }
+  }
+}
+
+static void audio_log(const char* fmt, ...){
+  if(audio_log_file){
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(audio_log_file, fmt, args);
+    va_end(args);
+    fflush(audio_log_file);
+  }
+}
+
+static void audio_log_close(void){
+  if(audio_log_file){
+    fclose(audio_log_file);
+    audio_log_file = nullptr;
+  }
+}
+#endif
 #ifdef USE_FFMPEG
 // FFmpeg headers are included via ffmpeg-audio.h
 #include "media/ffmpeg-audio.h"
@@ -77,32 +110,48 @@ static void audio_thread_func(audio_thread_data* data) {
   ncvisual* ncv = data->ncv;
   audio_output* ao = data->ao;
 
+  audio_log("Audio thread started\n");
+
   if(!ffmpeg_has_audio(ncv) || !ao){
+    audio_log("Audio thread: no audio or no audio output\n");
     return;
   }
 
   AVCodecContext* acodecctx = ffmpeg_get_audio_codec_context(ncv);
   if(!acodecctx){
+    audio_log("Audio thread: no audio codec context\n");
     return;
   }
 
-  int sample_rate = acodecctx->sample_rate;
   int channels = 0;
   if(acodecctx->ch_layout.nb_channels > 0){
     channels = acodecctx->ch_layout.nb_channels;
   }else{
+    // Fallback for older FFmpeg versions - suppress deprecation warning
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     channels = acodecctx->channels;
+    #pragma GCC diagnostic pop
   }
 
   // Initialize resampler for output format (S16, 44100 Hz, stereo/mono)
   int out_sample_rate = 44100;
   int out_channels = channels > 1 ? 2 : 1;
+  audio_log("Audio thread: initializing resampler (%d ch, %d Hz -> %d ch, %d Hz)\n",
+            channels, acodecctx->sample_rate, out_channels, out_sample_rate);
+
   if(ffmpeg_init_audio_resampler_public(ncv, out_sample_rate, out_channels) < 0){
+    audio_log("Failed to initialize audio resampler\n");
     return;
   }
 
+  audio_log("Audio thread: resampler initialized, starting packet reading loop\n");
+
   double audio_time_base = ffmpeg_get_audio_time_base(ncv);
   AVPacket* packet = nullptr;
+  int packet_count = 0;
+  int frame_count = 0;
+  int bytes_written = 0;
 
   while(*data->running){
     // Handle pause state
@@ -115,6 +164,7 @@ static void audio_thread_func(audio_thread_data* data) {
     if(!packet){
       int ret = ffmpeg_read_audio_packet(ncv, &packet);
       if(ret < 0){
+        audio_log("Error reading audio packet (ret=%d)\n", ret);
         break; // error
       }
       if(ret == 1){
@@ -126,13 +176,21 @@ static void audio_thread_func(audio_thread_data* data) {
           // Flush audio buffers and seek to start
           audio_output_flush(ao);
           ffmpeg_seek_to_start(ncv);
+          audio_log("Audio thread: looping, seeking to start\n");
           // Continue reading from the beginning
           continue;
         }else{
           // Not looping - wait a bit then exit
+          audio_log("Audio EOF reached, processed %d packets, %d frames, %d bytes written\n",
+                    packet_count, frame_count, bytes_written);
           usleep(100000); // 100ms
           break;
         }
+      }
+      packet_count++;
+      if(packet_count % 100 == 0){
+        audio_log("Audio thread: read %d packets, decoded %d frames, wrote %d bytes\n",
+                  packet_count, frame_count, bytes_written);
       }
     }
 
@@ -167,6 +225,7 @@ static void audio_thread_func(audio_thread_data* data) {
         // No frame data, but decode returned >0 - continue to next frame
         continue;
       }
+      frame_count++;
 
       // Resample to output format
       uint8_t* out_data = nullptr;
@@ -177,9 +236,11 @@ static void audio_thread_func(audio_thread_data* data) {
       if(out_samples > 0 && out_data){
         // Write to audio output
         if(audio_output_write(ao, out_data, out_linesize) < 0){
+          audio_log("Error writing audio data (packet %d, frame %d)\n", packet_count, frame_count);
           av_freep(&out_data);
           break; // error writing
         }
+        bytes_written += out_linesize;
 
         // Update audio clock with PTS
         if(frame->pts != AV_NOPTS_VALUE){
@@ -188,6 +249,8 @@ static void audio_thread_func(audio_thread_data* data) {
         }
 
         av_freep(&out_data);
+      } else if(out_samples < 0){
+        audio_log("Resampling error: %d (packet %d, frame %d)\n", out_samples, packet_count, frame_count);
       }
 
       // After first successful decode with packet, don't pass packet again
@@ -203,6 +266,10 @@ static void audio_thread_func(audio_thread_data* data) {
   if(packet){
     av_packet_free(&packet);
   }
+
+  // Final debug output
+  audio_log("Audio thread exiting: %d packets, %d frames, %d bytes written\n",
+            packet_count, frame_count, bytes_written);
 }
 #endif // USE_FFMPEG
 
@@ -477,7 +544,15 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
                                bool quiet, bool loop,
                                double timescale, double displaytime,
                                bool noninterp, uint32_t transcolor,
-                               bool climode){
+                               bool climode,
+#ifdef USE_FFMPEG
+                               bool* out_had_audio, bool* out_audio_init_success,
+                               int* out_audio_channels, int* out_audio_sample_rate
+#else
+                               void* out_had_audio, void* out_audio_init_success,
+                               void* out_audio_channels, void* out_audio_sample_rate
+#endif
+                               ){
   unsigned dimy, dimx;
   std::unique_ptr<Plane> stdn(nc.get_stdplane(&dimy, &dimx));
   if(climode){
@@ -565,22 +640,32 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
     if(ffmpeg_has_audio(raw_ncv)){
       AVCodecContext* acodecctx = ffmpeg_get_audio_codec_context(raw_ncv);
       if(acodecctx){
-        int sample_rate = acodecctx->sample_rate;
         int channels = 0;
         if(acodecctx->ch_layout.nb_channels > 0){
           channels = acodecctx->ch_layout.nb_channels;
         }else{
+          // Fallback for older FFmpeg versions - suppress deprecation warning
+          #pragma GCC diagnostic push
+          #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
           channels = acodecctx->channels;
+          #pragma GCC diagnostic pop
         }
 
-        if(!quiet){
-          std::cerr << "Audio detected: " << channels << " channels, " << sample_rate << " Hz" << std::endl;
+        // Store audio info for debug output (passed from outer function)
+        if(out_had_audio){
+          *out_had_audio = true;
+          *out_audio_channels = channels;
+          *out_audio_sample_rate = acodecctx->sample_rate;
         }
 
-        ao = audio_output_init(sample_rate, channels > 1 ? 2 : 1, acodecctx->sample_fmt);
+        // Initialize audio output with resampled rate (44100 Hz) for consistency
+        int out_sample_rate = 44100;
+        int out_channels = channels > 1 ? 2 : 1;
+        // AV_SAMPLE_FMT_S16 = 1 (from libavutil/samplefmt.h)
+        ao = audio_output_init(out_sample_rate, out_channels, 1);
         if(ao){
-          if(!quiet){
-            std::cerr << "Audio output initialized successfully" << std::endl;
+          if(out_audio_init_success){
+            *out_audio_init_success = true;
           }
           audio_running = true;
 
@@ -594,27 +679,16 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
           audio_data->paused = false;
           audio_data->loop = loop;
 
+          // Initialize audio log file
+          audio_log_init();
+
           // Start audio thread
           audio_thread = new std::thread(audio_thread_func, audio_data);
 
           // Start audio playback
           audio_output_start(ao);
-          if(!quiet){
-            std::cerr << "Audio playback started" << std::endl;
-          }
-        }else{
-          if(!quiet){
-            std::cerr << "Failed to initialize audio output" << std::endl;
-          }
+          audio_log("Audio playback started from main thread\n");
         }
-      }else{
-        if(!quiet){
-          std::cerr << "No audio codec context found" << std::endl;
-        }
-      }
-    }else{
-      if(!quiet){
-        std::cerr << "No audio stream detected" << std::endl;
       }
     }
 #endif
@@ -682,7 +756,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
             audio_output_flush(ao);
           }
           // Seek both video and audio streams
-          ncvisual* raw_ncv = *ncv;
+          // raw_ncv is already declared in outer scope (line 580)
           if(ffmpeg_has_audio(raw_ncv)){
             ffmpeg_seek_to_start(raw_ncv);
           }
@@ -742,6 +816,8 @@ err:
       audio_output_destroy(ao);
     }
   }
+  // Close audio log file
+  audio_log_close();
 #endif
   free(ncplane_userptr(n));
   ncplane_destroy(n);
@@ -760,6 +836,13 @@ int rendered_mode_player(int argc, char** argv, ncscale_e scalemode,
     ncopts.flags |= NCOPTION_SUPPRESS_BANNERS;
   }
   int r;
+#ifdef USE_FFMPEG
+  // Store audio info for debug output after notcurses stops
+  bool had_audio = false;
+  bool audio_init_success = false;
+  int audio_channels = 0;
+  int audio_sample_rate = 0;
+#endif
   try{
     NotCurses nc{ncopts};
     if(!nc.can_open_images()){
@@ -769,10 +852,36 @@ int rendered_mode_player(int argc, char** argv, ncscale_e scalemode,
     }
     r = rendered_mode_player_inner(nc, argc, argv, scalemode, blitter,
                                    quiet, loop, timescale, displaytime,
-                                   noninterp, transcolor, climode);
+                                   noninterp, transcolor, climode,
+#ifdef USE_FFMPEG
+                                   &had_audio, &audio_init_success,
+                                   &audio_channels, &audio_sample_rate
+#else
+                                   nullptr, nullptr, nullptr, nullptr
+#endif
+                                   );
     if(!nc.stop()){
       return -1;
     }
+    // Print audio debug info AFTER notcurses stops (so it appears with stats)
+#ifdef USE_FFMPEG
+    if(!quiet){
+      if(had_audio){
+        fprintf(stderr, "Audio: %d channels, %d Hz", audio_channels, audio_sample_rate);
+        if(audio_init_success){
+          fprintf(stderr, " (initialized and played");
+          fprintf(stderr, " - see /tmp/ncplayer_audio.log for details)\n");
+        }else{
+          fprintf(stderr, " (failed to initialize)\n");
+        }
+      }else{
+        fprintf(stderr, "Audio: no audio stream detected\n");
+      }
+      fflush(stderr);
+    }
+    // Close audio log file
+    audio_log_close();
+#endif
   }catch(ncpp::init_error& e){
     std::cerr << e.what() << "\n";
     return -1;
