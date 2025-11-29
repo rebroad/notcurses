@@ -136,6 +136,26 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   const uint64_t default_frame_ns = 41666667ull; // ~24fps
   const uint64_t expected_frame_ns = marsh->avg_frame_ns ? marsh->avg_frame_ns : default_frame_ns;
 
+  struct timespec nowts;
+  clock_gettime(CLOCK_MONOTONIC, &nowts);
+  uint64_t now_ns = timespec_to_ns(&nowts);
+  int64_t lag_ns = (int64_t)now_ns - (int64_t)target_ns;
+  const uint64_t drop_threshold_ns = expected_frame_ns * 3 / 2; // drop once 1.5 frames behind
+  if(lag_ns > (int64_t)drop_threshold_ns){
+    marsh->dropped_frames++;
+    if(marsh->dropped_frames % 25 == 0){
+      double lag_ms = lag_ns / 1e6;
+      audio_log("Video thread: Dropping frame to catch up (drops=%" PRIu64 ", lag=%.2fms)\n",
+                marsh->dropped_frames, lag_ms);
+    }
+    return 0;
+  }
+  if(lag_ns < 0){
+    struct timespec sleep_ts;
+    ns_to_timespec((uint64_t)(-lag_ns), &sleep_ts);
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_ts, NULL);
+  }
+
   struct ncplane* subp = ncvisual_subtitle_plane(*stdn, ncv);
   const int64_t h = ns / (60 * 60 * NANOSECS_IN_SEC);
   ns -= h * (60 * 60 * NANOSECS_IN_SEC);
@@ -220,27 +240,6 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     ncplane_destroy(subp);
     return 1;
   }
-  struct timespec nowts;
-  clock_gettime(CLOCK_MONOTONIC, &nowts);
-  uint64_t now_ns = timespec_to_ns(&nowts);
-  int64_t lag_ns = (int64_t)now_ns - (int64_t)target_ns;
-  const uint64_t drop_threshold_ns = expected_frame_ns * 2;
-  if(lag_ns > (int64_t)drop_threshold_ns){
-    marsh->dropped_frames++;
-    if(marsh->dropped_frames % 25 == 0){
-      audio_log("Video thread: Dropping frames to catch up (dropped=%" PRIu64 ", lag=%.2fms)\n",
-                marsh->dropped_frames, lag_ns / 1e6);
-    }
-    ncplane_destroy(subp);
-    return 0;
-  }
-
-  if(lag_ns < 0){
-    struct timespec sleep_ts;
-    ns_to_timespec((uint64_t)(-lag_ns), &sleep_ts);
-    clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_ts, NULL);
-  }
-
   ncplane_destroy(subp);
   return 0;
 }
