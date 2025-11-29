@@ -1,5 +1,8 @@
 #include "builddef.h"
 #ifdef USE_FFMPEG
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixdesc.h>
@@ -20,6 +23,20 @@
 #include "lib/internal.h"
 
 struct AVFormatContext;
+
+// Simple audio logging function - writes to /tmp/ncplayer_audio.log
+static void audio_log(const char* fmt, ...){
+  FILE* logfile = fopen("/tmp/ncplayer_audio.log", "a");
+  if(!logfile){
+    return;
+  }
+  va_list args;
+  va_start(args, fmt);
+  vfprintf(logfile, fmt, args);
+  va_end(args);
+  fflush(logfile);
+  fclose(logfile);
+}
 struct AVCodecContext;
 struct AVFrame;
 struct AVCodec;
@@ -40,12 +57,15 @@ typedef struct ncvisual_details {
   struct SwsContext* swsctx;
   struct SwsContext* rgbactx;
   struct SwrContext* swrctx;           // audio resampler context
+  int audio_out_channels;              // output channel count for resampler (1 or 2)
   AVSubtitle subtitle;
   int stream_index;        // match against this following av_read_frame()
   int sub_stream_index;    // subtitle stream index, can be < 0 if no subtitles
   int audio_stream_index;  // audio stream index, can be < 0 if no audio
   bool packet_outstanding;
   bool audio_packet_outstanding; // whether we have an audio packet waiting to be decoded
+  AVPacket* pending_audio_packet; // audio packet that couldn't be sent (decoder full)
+  int64_t last_audio_frame_pts; // PTS of last processed audio frame (to prevent reprocessing)
   pthread_mutex_t packet_mutex;  // mutex for thread-safe packet reading
 } ncvisual_details;
 
@@ -357,27 +377,61 @@ ffmpeg_decode(ncvisual* n){
         // Handle audio packets - send them to audio decoder (audio thread will receive frames)
         if(n->details->packet->stream_index == n->details->audio_stream_index){
           if(n->details->audiocodecctx){
-            // Send packet to audio decoder (audio thread will receive decoded frames)
-            // Keep trying to send if decoder is full (audio thread will drain it)
-            int audio_ret;
-            int retry_count = 0;
-            do{
-              audio_ret = avcodec_send_packet(n->details->audiocodecctx, n->details->packet);
-              if(audio_ret == AVERROR(EAGAIN)){
-                // Decoder full - audio thread needs to receive frames first
-                // Don't retry here - let audio thread drain it
+            static int audio_packet_count = 0;
+            audio_packet_count++;
+
+            // First, try to send any pending audio packet
+            if(n->details->pending_audio_packet){
+              int retry_ret = avcodec_send_packet(n->details->audiocodecctx, n->details->pending_audio_packet);
+              if(retry_ret == 0){
+                // Successfully sent pending packet
+                audio_log("ffmpeg_decode: Sent pending audio packet successfully\n");
+                av_packet_free(&n->details->pending_audio_packet);
                 n->details->audio_packet_outstanding = true;
-                break;
-              }else if(audio_ret == 0){
-                n->details->audio_packet_outstanding = true;
-                break;
-              }else if(audio_ret < 0 && audio_ret != AVERROR_EOF){
-                // Error sending packet
-                break;
+              }else if(retry_ret == AVERROR(EAGAIN)){
+                // Still full - keep pending packet and try new one
+                if(audio_packet_count % 100 == 0){
+                  audio_log("ffmpeg_decode: Pending packet still can't be sent (EAGAIN), packet_count=%d\n", audio_packet_count);
+                }
+              }else{
+                // Error - free pending packet
+                audio_log("ffmpeg_decode: Error sending pending packet: %d\n", retry_ret);
+                av_packet_free(&n->details->pending_audio_packet);
               }
-            }while(++retry_count < 10); // Safety limit
+            }
+
+            // Now try to send the new packet
+            int audio_ret = avcodec_send_packet(n->details->audiocodecctx, n->details->packet);
+            if(audio_ret == 0){
+              n->details->audio_packet_outstanding = true;
+              if(audio_packet_count <= 10 || audio_packet_count % 100 == 0){
+                audio_log("ffmpeg_decode: Sent audio packet %d successfully\n", audio_packet_count);
+              }
+              av_packet_unref(n->details->packet);
+            }else if(audio_ret == AVERROR(EAGAIN)){
+              // Decoder full - save this packet for next time
+              if(audio_packet_count <= 10 || audio_packet_count % 100 == 0){
+                audio_log("ffmpeg_decode: Audio decoder full (EAGAIN), saving packet %d\n", audio_packet_count);
+              }
+              if(n->details->pending_audio_packet){
+                // Already have a pending packet - drop the old one (shouldn't happen often)
+                av_packet_free(&n->details->pending_audio_packet);
+              }
+              // Clone packet manually for compatibility (av_packet_clone may not exist)
+              n->details->pending_audio_packet = av_packet_alloc();
+              if(n->details->pending_audio_packet){
+                av_packet_ref(n->details->pending_audio_packet, n->details->packet);
+              }
+              av_packet_unref(n->details->packet);
+            }else{
+              if(audio_packet_count <= 10){
+                audio_log("ffmpeg_decode: Error sending audio packet %d: %d\n", audio_packet_count, audio_ret);
+              }
+              av_packet_unref(n->details->packet);
+            }
+          }else{
+            av_packet_unref(n->details->packet);
           }
-          av_packet_unref(n->details->packet);
           continue; // Continue reading, this wasn't a video packet
         }
 
@@ -425,6 +479,9 @@ ffmpeg_details_init(void){
     deets->stream_index = -1;
     deets->sub_stream_index = -1;
     deets->audio_stream_index = -1;
+    deets->last_audio_frame_pts = AV_NOPTS_VALUE; // No frame processed yet
+    deets->audio_out_channels = 0; // Will be set when resampler is initialized
+    deets->pending_audio_packet = NULL; // No pending packet initially
     if(pthread_mutex_init(&deets->packet_mutex, NULL) != 0){
       free(deets);
       return NULL;
@@ -666,6 +723,9 @@ ffmpeg_init_audio_resampler_internal(ncvisual* ncv, int out_sample_rate, int out
     swr_free(&ncv->details->swrctx);
     return -1;
   }
+
+  // Store output channel count for buffer size calculations
+  ncv->details->audio_out_channels = out_channels;
 
   return 0;
 }
@@ -912,6 +972,8 @@ ffmpeg_details_destroy(ncvisual_details* deets){
   avcodec_free_context(&deets->codecctx);
   av_frame_free(&deets->frame);
   av_frame_free(&deets->audio_frame);
+  av_packet_free(&deets->pending_audio_packet);
+  av_frame_free(&deets->audio_frame);
   swr_free(&deets->swrctx);
   sws_freeContext(deets->rgbactx);
   sws_freeContext(deets->swsctx);
@@ -963,6 +1025,7 @@ ffmpeg_init_audio_resampler(ncvisual* ncv, int out_sample_rate, int out_channels
 // Try to get a decoded audio frame (packets are read by video decoder)
 // Returns: >0 = samples decoded, 0 = no frame available, <0 = error
 // This function is called by the audio thread - it doesn't read packets
+// IMPORTANT: avcodec_receive_frame can only return a frame once per packet sent
 API int
 ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
   if(!ncv || !ncv->details || ncv->details->audio_stream_index < 0){
@@ -970,12 +1033,32 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
   }
 
   // Try to receive a decoded frame (non-blocking)
-  // Don't check audio_packet_outstanding - just try to receive
-  // The decoder might have frames ready even if we haven't sent a packet recently
+  // This will only return a frame once per packet - subsequent calls return EAGAIN
   int averr = avcodec_receive_frame(ncv->details->audiocodecctx, ncv->details->audio_frame);
   if(averr == 0){
     ncv->details->audio_packet_outstanding = false;
+    // Check if this is a new frame (different PTS) or the same one we already processed
+    int64_t current_pts = ncv->details->audio_frame->pts;
+    if(current_pts == ncv->details->last_audio_frame_pts && current_pts != AV_NOPTS_VALUE){
+      // Same frame as before - don't process again
+      // This can happen if avcodec_receive_frame is called multiple times
+      // Note: avcodec_receive_frame should only return each frame once, so this
+      // check is defensive. If we see this frequently, there's a bug elsewhere.
+      return 0;
+    }
+    ncv->details->last_audio_frame_pts = current_pts;
     return ncv->details->audio_frame->nb_samples;
+  }else if(averr == AVERROR(EAGAIN)){
+    // Need more packets - but check if we have packets outstanding
+    // If audio_packet_outstanding is false, it means we've consumed all packets
+    // and need the video decoder to send more
+    if(!ncv->details->audio_packet_outstanding){
+      // No packets outstanding - video decoder needs to send more
+      return 0;
+    }
+    // We have packets outstanding but no frame - this shouldn't happen normally
+    // but can happen if the decoder needs more packets to produce a frame
+    return 0;
   }else if(averr == AVERROR(EAGAIN)){
     // Need more packets - video decoder will provide them
     return 0;
@@ -988,6 +1071,8 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
 
 // Resample audio frame to output format
 // Returns: number of samples output, <0 on error
+// NOTE: This should be called immediately after ffmpeg_get_decoded_audio_frame returns >0
+// The frame data is only valid until the next call to avcodec_receive_frame
 API int
 ffmpeg_resample_audio(ncvisual* ncv, uint8_t** out_data, int* out_samples){
   if(!ncv || !ncv->details || !ncv->details->swrctx || !ncv->details->audio_frame){
@@ -1005,13 +1090,22 @@ ffmpeg_resample_audio(ncvisual* ncv, uint8_t** out_data, int* out_samples){
     return -1;
   }
 
-  int out_channels = ncv->details->audiocodecctx->ch_layout.nb_channels;
-  if(out_channels == 0){
-    // Fallback for older FFmpeg
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    out_channels = ncv->details->audiocodecctx->channels;
-    #pragma GCC diagnostic pop
+  // Use OUTPUT channel count (from resampler), not input channel count
+  int out_channels = ncv->details->audio_out_channels;
+  if(out_channels <= 0){
+    // Fallback: use input channel count, but limit to 2
+    out_channels = ncv->details->audiocodecctx->ch_layout.nb_channels;
+    if(out_channels == 0){
+      // Fallback for older FFmpeg
+      #pragma GCC diagnostic push
+      #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+      out_channels = ncv->details->audiocodecctx->channels;
+      #pragma GCC diagnostic pop
+    }
+    // Limit to stereo max
+    if(out_channels > 2){
+      out_channels = 2;
+    }
   }
 
   int out_size = av_samples_get_buffer_size(NULL, out_channels, out_count,
