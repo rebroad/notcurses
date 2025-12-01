@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <clocale>
 #include <sstream>
+#include <string>
 #include <getopt.h>
 #include <libgen.h>
 #include <unistd.h>
@@ -172,6 +173,39 @@ static constexpr int kNcplayerVolumeOverlayMs = 1000;
 static constexpr int kNcplayerVolumeStep = 5;
 static constexpr uint64_t kNcplayerDefaultFrameNs = 41666667ull; // ~24fps
 static constexpr double kNcplayerFpsFloorRatio = 0.9;            // 90%
+
+static std::string
+format_hms(double seconds){
+  if(!std::isfinite(seconds)){
+    return "unknown";
+  }
+  bool negative = seconds < 0.0;
+  double abs_seconds = std::fabs(seconds);
+  int hours = static_cast<int>(abs_seconds / 3600.0);
+  abs_seconds -= hours * 3600.0;
+  int minutes = static_cast<int>(abs_seconds / 60.0);
+  abs_seconds -= minutes * 60.0;
+  double secs = abs_seconds;
+  int whole_secs = static_cast<int>(secs);
+  double frac = secs - whole_secs;
+  int frac_part = static_cast<int>(std::round(frac * 10000.0));
+  if(frac_part == 10000){
+    frac_part = 0;
+    ++whole_secs;
+    if(whole_secs == 60){
+      whole_secs = 0;
+      ++minutes;
+      if(minutes == 60){
+        minutes = 0;
+        ++hours;
+      }
+    }
+  }
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%s%02d:%02d:%02d.%04d",
+                negative ? "-" : "", hours, minutes, whole_secs, frac_part);
+  return std::string(buf);
+}
 // frame count is in the curry. original time is kept in n's userptr.
 auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
               const struct timespec* abstime, void* vmarshal) -> int {
@@ -290,14 +324,19 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
           double diff_ms = diff_seconds * 1e3;
           double threshold_ms = threshold_seconds * 1e3;
           const char* relation = diff_seconds > 0.0 ? "ahead of" : "behind";
-          logwarn("[av-sync] video %.2fms %s audio (threshold %.2fms, frame %06d)",
-                  std::fabs(diff_ms), relation, threshold_ms, marsh->framecount);
+          const std::string video_stamp = format_hms(video_seconds);
+          const std::string audio_stamp = format_hms(audio_seconds);
+          logwarn("[av-sync] video %.2fms %s audio (threshold %.2fms, frame %06d, video=%s, audio=%s)",
+                  std::fabs(diff_ms), relation, threshold_ms, marsh->framecount,
+                  video_stamp.c_str(), audio_stamp.c_str());
           marsh->av_sync_state = new_state;
         }
       }else if(marsh->av_sync_state != 0){
         double diff_ms = diff_seconds * 1e3;
-        loginfo("[av-sync] recovered (delta %.2fms, frame %06d)",
-                diff_ms, marsh->framecount);
+        const std::string video_stamp = format_hms(video_seconds);
+        const std::string audio_stamp = format_hms(audio_seconds);
+        loginfo("[av-sync] recovered (delta %.2fms, frame %06d, video=%s, audio=%s)",
+                diff_ms, marsh->framecount, video_stamp.c_str(), audio_stamp.c_str());
         marsh->av_sync_state = 0;
       }
     }
