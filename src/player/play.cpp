@@ -280,7 +280,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   audio_output* global_audio = audio_output_get_global();
   if(global_audio != nullptr){
     double audio_seconds = audio_output_get_clock(global_audio);
-    if(std::isfinite(audio_seconds)){
+    if(std::isfinite(audio_seconds) && audio_seconds > 0.0){
       double video_seconds = static_cast<double>(display_ns) / 1e9;
       double diff_seconds = video_seconds - audio_seconds;
       double threshold_seconds = static_cast<double>(expected_frame_ns) * 1.5 / 1e9;
@@ -966,7 +966,13 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         }
         ao = audio_output_init(sample_rate, channels, AV_SAMPLE_FMT_S16);
         if(ao){
-          logdebug("[audio] starting audio thread");
+          const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
+          const int iter = stream_iteration - 1;
+          if(std::isfinite(audio_pos)){
+            logdebug("[audio] starting audio thread (iteration %d, media %.3fs)", iter, audio_pos);
+          }else{
+            logdebug("[audio] starting audio thread (iteration %d, media unknown)", iter);
+          }
           audio_running = true;
           audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
           audio_thread = new std::thread(audio_thread_func, audio_data);
@@ -1005,7 +1011,15 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       }
       show_fps_overlay = marsh.show_fps;
       if(audio_thread && !preserve_audio){
-        logdebug("[audio] stopping audio thread");
+        const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
+        const int iter = stream_iteration - 1;
+        if(std::isfinite(audio_pos)){
+          logdebug("[audio] stopping audio thread (iteration %d, media %.3fs, frame %06d)",
+                   iter, audio_pos, marsh.framecount);
+        }else{
+          logdebug("[audio] stopping audio thread (iteration %d, media unknown, frame %06d)",
+                   iter, marsh.framecount);
+        }
         audio_running = false;
         audio_thread->join();
         delete audio_thread;
