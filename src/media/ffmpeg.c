@@ -47,6 +47,7 @@ struct AVPacket;
 double ffmpeg_get_video_position_seconds(const ncvisual* ncv);
 
 #define AUDIO_PACKET_QUEUE_SIZE 8
+#define IMGALLOCALIGN 64
 
 typedef struct audio_packet_queue {
   AVPacket* packets[AUDIO_PACKET_QUEUE_SIZE];
@@ -178,6 +179,12 @@ typedef struct ncvisual_details {
   pthread_mutex_t packet_mutex;  // mutex for thread-safe packet reading
   pthread_mutex_t audio_packet_mutex; // mutex for audio packet queue
   pthread_cond_t audio_packet_cond;   // notify audio thread when packets ready
+  uint8_t* resize_cache_mem;
+  uint8_t* resize_cache_data[4];
+  int resize_cache_linesize[4];
+  int resize_cache_rows;
+  int resize_cache_cols;
+  enum AVPixelFormat resize_cache_format;
 } ncvisual_details;
 
 #define AUDIO_LOG_QUEUE_OPS 1
@@ -260,6 +267,44 @@ audio_wait_for_packets_locked(ncvisual_details* deets, unsigned milliseconds){
   pthread_cond_timedwait(&deets->audio_packet_cond, &deets->audio_packet_mutex, &ts);
 }
 
+static bool
+ensure_resize_cache(ncvisual_details* deets, enum AVPixelFormat format,
+                    int cols, int rows){
+  if(deets == NULL){
+    return false;
+  }
+  if(deets->resize_cache_mem &&
+     deets->resize_cache_cols == cols &&
+     deets->resize_cache_rows == rows &&
+     deets->resize_cache_format == format){
+    return true;
+  }
+  if(deets->resize_cache_mem){
+    av_freep(&deets->resize_cache_mem);
+  }
+  const int size = av_image_get_buffer_size(format, cols, rows, IMGALLOCALIGN);
+  if(size < 0){
+    return false;
+  }
+  uint8_t* buf = av_malloc(size);
+  if(buf == NULL){
+    return false;
+  }
+  uint8_t* data[4];
+  int linesize[4];
+  if(av_image_fill_arrays(data, linesize, buf, format, cols, rows, IMGALLOCALIGN) < 0){
+    av_free(buf);
+    return false;
+  }
+  memcpy(deets->resize_cache_data, data, sizeof(data));
+  memcpy(deets->resize_cache_linesize, linesize, sizeof(linesize));
+  deets->resize_cache_mem = buf;
+  deets->resize_cache_cols = cols;
+  deets->resize_cache_rows = rows;
+  deets->resize_cache_format = format;
+  return true;
+}
+
 static void
 ffmpeg_drain_pending_audio_locked(ncvisual_details* deets){
   if(!deets->audiocodecctx){
@@ -292,8 +337,6 @@ ffmpeg_drain_pending_audio_locked(ncvisual_details* deets){
     deets->audio_packet_outstanding = false;
   }
 }
-
-#define IMGALLOCALIGN 64
 
 uint64_t ffmpeg_pkt_duration(const AVFrame* frame){
 #if LIBAVUTIL_VERSION_MAJOR < 58
@@ -1362,8 +1405,8 @@ ffmpeg_decode_loop(ncvisual* ncv){
 // otherwise, a scaled copy will be returned. they can be differentiated by
 // comparing the result against ncv->data.
 static uint32_t*
-ffmpeg_resize_internal(const ncvisual* ncv, int rows, int* stride, int cols,
-                       const blitterargs* bargs){
+ffmpeg_resize_internal(ncvisual* ncv, int rows, int* stride, int cols,
+                       const blitterargs* bargs, bool* from_cache){
   const AVFrame* inframe = ncv->details->frame;
 //print_frame_summary(NULL, inframe);
   const int targformat = AV_PIX_FMT_RGBA;
@@ -1387,24 +1430,36 @@ ffmpeg_resize_internal(const ncvisual* ncv, int rows, int* stride, int cols,
     return NULL;
   }
   // necessitated by ffmpeg AVPicture API
-  uint8_t* dptrs[4];
-  int dlinesizes[4];
-  int size = av_image_alloc(dptrs, dlinesizes, cols, rows, targformat, IMGALLOCALIGN);
-  if(size < 0){
-//fprintf(stderr, "Error allocating visual data (%d X %d)\n", sframe->height, sframe->width);
-    return NULL;
+  uint8_t* local_dptrs[4];
+  int local_dlinesizes[4];
+  uint8_t** dptrs = local_dptrs;
+  int* dlinesizes = local_dlinesizes;
+  bool cache_used = false;
+  if(ensure_resize_cache(ncv->details, targformat, cols, rows)){
+    dptrs = ncv->details->resize_cache_data;
+    dlinesizes = ncv->details->resize_cache_linesize;
+    cache_used = true;
+  }else{
+    int size = av_image_alloc(local_dptrs, local_dlinesizes, cols, rows,
+                              targformat, IMGALLOCALIGN);
+    if(size < 0){
+      return NULL;
+    }
   }
-//fprintf(stderr, "INFRAME DAA: %p SDATA: %p FDATA: %p to %d/%d\n", inframe->data[0], sframe->data[0], ncv->details->frame->data[0], sframe->height, sframe->width);
-  const uint8_t* data[4] = { (uint8_t*)ncv->data, };
-  int height = sws_scale(ncv->details->swsctx, data,
+  const uint8_t* sourcedata[4] = { (uint8_t*)ncv->data, };
+  int height = sws_scale(ncv->details->swsctx, sourcedata,
                          inframe->linesize, 0, srcleny, dptrs, dlinesizes);
   if(height < 0){
-//fprintf(stderr, "Error applying scaling (%d X %d)\n", inframe->height, inframe->width);
-    av_freep(&dptrs[0]);
+    if(!cache_used){
+      av_freep(&dptrs[0]);
+    }
     return NULL;
   }
+  if(from_cache){
+    *from_cache = cache_used;
+  }
 //fprintf(stderr, "scaled %d/%d to %d/%d\n", ncv->pixy, ncv->pixx, rows, cols);
-  *stride = dlinesizes[0]; // FIXME check for others?
+  *stride = dlinesizes[0];
   return (uint32_t*)dptrs[0];
 }
 
@@ -1413,7 +1468,8 @@ static int
 ffmpeg_resize(ncvisual* n, unsigned rows, unsigned cols){
   struct blitterargs bargs = {0};
   int stride;
-  void* data = ffmpeg_resize_internal(n, rows, &stride, cols, &bargs);
+  bool from_cache = false;
+  void* data = ffmpeg_resize_internal(n, rows, &stride, cols, &bargs, &from_cache);
   if(data == n->data){ // no change, return
     return 0;
   }
@@ -1428,7 +1484,7 @@ ffmpeg_resize(ncvisual* n, unsigned rows, unsigned cols){
   n->rowstride = stride;
   n->pixy = rows;
   n->pixx = cols;
-  ncvisual_set_data(n, data, true);
+  ncvisual_set_data(n, data, !from_cache);
 //fprintf(stderr, "SIZE SCALED: %d %d (%u)\n", n->details->frame->height, n->details->frame->width, n->details->frame->linesize[0]);
   return 0;
 }
@@ -1439,7 +1495,8 @@ ffmpeg_blit(const ncvisual* ncv, unsigned rows, unsigned cols, ncplane* n,
             const struct blitset* bset, const blitterargs* bargs){
   void* data;
   int stride = 0;
-  data = ffmpeg_resize_internal(ncv, rows, &stride, cols, bargs);
+  bool from_cache = false;
+  data = ffmpeg_resize_internal((ncvisual*)ncv, rows, &stride, cols, bargs, &from_cache);
   if(data == NULL){
     return -1;
   }
@@ -1448,7 +1505,7 @@ ffmpeg_blit(const ncvisual* ncv, unsigned rows, unsigned cols, ncplane* n,
   if(rgba_blit_dispatch(n, bset, stride, data, rows, cols, bargs) < 0){
     ret = -1;
   }
-  if(data != ncv->data){
+  if(data != ncv->data && !from_cache){
     av_freep(&data); // &dptrs[0]
   }
   return ret;
@@ -1517,6 +1574,7 @@ ffmpeg_details_destroy(ncvisual_details* deets){
   avformat_close_input(&deets->fmtctx);
   avsubtitle_free(&deets->subtitle);
   free(deets->subtitle_cached_text);
+  av_freep(&deets->resize_cache_mem);
   pthread_cond_destroy(&deets->audio_packet_cond);
   pthread_mutex_destroy(&deets->audio_packet_mutex);
   pthread_mutex_destroy(&deets->packet_mutex);
