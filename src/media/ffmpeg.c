@@ -177,6 +177,7 @@ typedef struct ncvisual_details {
   int64_t decoded_frames;
   pthread_mutex_t packet_mutex;  // mutex for thread-safe packet reading
   pthread_mutex_t audio_packet_mutex; // mutex for audio packet queue
+  pthread_cond_t audio_packet_cond;   // notify audio thread when packets ready
 } ncvisual_details;
 
 #define AUDIO_LOG_QUEUE_OPS 1
@@ -236,6 +237,30 @@ audio_queue_pop(audio_packet_queue* q){
 }
 
 static void
+audio_signal_packets(ncvisual_details* deets){
+  if(deets){
+    pthread_cond_signal(&deets->audio_packet_cond);
+  }
+}
+
+static void
+audio_wait_for_packets_locked(ncvisual_details* deets, unsigned milliseconds){
+  if(deets == NULL){
+    return;
+  }
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  ts.tv_sec += milliseconds / 1000;
+  const unsigned extra_ms = milliseconds % 1000;
+  ts.tv_nsec += (long)extra_ms * 1000000L;
+  if(ts.tv_nsec >= 1000000000L){
+    ts.tv_nsec -= 1000000000L;
+    ++ts.tv_sec;
+  }
+  pthread_cond_timedwait(&deets->audio_packet_cond, &deets->audio_packet_mutex, &ts);
+}
+
+static void
 ffmpeg_drain_pending_audio_locked(ncvisual_details* deets){
   if(!deets->audiocodecctx){
     audio_queue_clear(&deets->pending_audio_packets);
@@ -251,10 +276,12 @@ ffmpeg_drain_pending_audio_locked(ncvisual_details* deets){
     if(ret == 0){
       audio_queue_pop(&deets->pending_audio_packets);
       deets->audio_packet_outstanding = true;
+      audio_signal_packets(deets);
       continue;
     }else if(ret == AVERROR(EAGAIN)){
       // Decoder still full; keep outstanding flag set because queue still populated.
       deets->audio_packet_outstanding = true;
+      audio_signal_packets(deets);
       return;
     }else{
       // Drop problematic packet and keep trying remaining ones.
@@ -849,10 +876,12 @@ ffmpeg_decode(ncvisual* n){
             int audio_ret = avcodec_send_packet(n->details->audiocodecctx, n->details->packet);
             if(audio_ret == 0){
               n->details->audio_packet_outstanding = true;
+              audio_signal_packets(n->details);
             }else if(audio_ret == AVERROR(EAGAIN)){
               // Decoder full - save this packet for next time
               if(audio_queue_enqueue(&n->details->pending_audio_packets, n->details->packet) == 0){
                 n->details->audio_packet_outstanding = true;
+                audio_signal_packets(n->details);
               }
             }
             av_packet_unref(n->details->packet);
@@ -939,13 +968,23 @@ ffmpeg_details_init(void){
       free(deets);
       return NULL;
     }
+    if(pthread_cond_init(&deets->audio_packet_cond, NULL) != 0){
+      pthread_mutex_destroy(&deets->audio_packet_mutex);
+      pthread_mutex_destroy(&deets->packet_mutex);
+      free(deets);
+      return NULL;
+    }
     if((deets->frame = av_frame_alloc()) == NULL){
+      pthread_cond_destroy(&deets->audio_packet_cond);
+      pthread_mutex_destroy(&deets->audio_packet_mutex);
       pthread_mutex_destroy(&deets->packet_mutex);
       free(deets);
       return NULL;
     }
     if((deets->audio_frame = av_frame_alloc()) == NULL){
       av_frame_free(&deets->frame);
+      pthread_cond_destroy(&deets->audio_packet_cond);
+      pthread_mutex_destroy(&deets->audio_packet_mutex);
       pthread_mutex_destroy(&deets->packet_mutex);
       free(deets);
       return NULL;
@@ -1478,6 +1517,7 @@ ffmpeg_details_destroy(ncvisual_details* deets){
   avformat_close_input(&deets->fmtctx);
   avsubtitle_free(&deets->subtitle);
   free(deets->subtitle_cached_text);
+  pthread_cond_destroy(&deets->audio_packet_cond);
   pthread_mutex_destroy(&deets->audio_packet_mutex);
   pthread_mutex_destroy(&deets->packet_mutex);
   free(deets);
@@ -1527,13 +1567,17 @@ ffmpeg_audio_request_packets(ncvisual* ncv){
   if(!ncv || !ncv->details){
     return;
   }
-  pthread_mutex_lock(&ncv->details->audio_packet_mutex);
-  if(!atomic_load_explicit(&ncv->details->audio_enabled, memory_order_relaxed)){
-    pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
+  ncvisual_details* deets = ncv->details;
+  pthread_mutex_lock(&deets->audio_packet_mutex);
+  if(!atomic_load_explicit(&deets->audio_enabled, memory_order_relaxed)){
+    pthread_mutex_unlock(&deets->audio_packet_mutex);
     return;
   }
-  ffmpeg_drain_pending_audio_locked(ncv->details);
-  pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
+  ffmpeg_drain_pending_audio_locked(deets);
+  if(!(deets->audio_packet_outstanding || deets->pending_audio_packets.count > 0)){
+    audio_wait_for_packets_locked(deets, 5);
+  }
+  pthread_mutex_unlock(&deets->audio_packet_mutex);
 }
 
 API void
@@ -1555,6 +1599,7 @@ ffmpeg_set_audio_enabled(ncvisual* ncv, bool enabled){
       avcodec_flush_buffers(deets->audiocodecctx);
     }
   }
+  pthread_cond_broadcast(&deets->audio_packet_cond);
   pthread_mutex_unlock(&deets->audio_packet_mutex);
 }
 
@@ -1626,6 +1671,10 @@ ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
     ncv->details->last_audio_frame_pts = current_pts;
     return ncv->details->audio_frame->nb_samples;
   }else if(averr == AVERROR(EAGAIN)){
+    ffmpeg_drain_pending_audio_locked(ncv->details);
+    if(!(ncv->details->audio_packet_outstanding || ncv->details->pending_audio_packets.count > 0)){
+      audio_wait_for_packets_locked(ncv->details, 5);
+    }
     pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
     // Need more packets - video decoder will provide them
     // This is normal - the decoder needs more packets before it can produce a frame
