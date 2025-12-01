@@ -156,6 +156,7 @@ struct marshal {
   bool show_fps;
   double current_fps;
   double current_drop_pct;
+  bool fps_below_target;
   PlaybackRequest request;
   double seek_delta;
   bool seek_absolute;
@@ -168,6 +169,8 @@ static constexpr double kNcplayerSeekSeconds = 5.0;
 static constexpr double kNcplayerSeekMinutes = 2.0 * 60.0;
 static constexpr int kNcplayerVolumeOverlayMs = 1000;
 static constexpr int kNcplayerVolumeStep = 5;
+static constexpr uint64_t kNcplayerDefaultFrameNs = 41666667ull; // ~24fps
+static constexpr double kNcplayerFpsFloorRatio = 0.9;            // 90%
 // frame count is in the curry. original time is kept in n's userptr.
 auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
               const struct timespec* abstime, void* vmarshal) -> int {
@@ -196,6 +199,22 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         marsh->current_fps = frames_since_sample * 1000.0 / elapsed;
         const uint64_t total_attempted = marsh->framecount + marsh->dropped_frames;
         marsh->current_drop_pct = total_attempted ? (100.0 * marsh->dropped_frames / total_attempted) : 0.0;
+        const uint64_t expected_frame_ns_snapshot = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
+        if(expected_frame_ns_snapshot > 0){
+          const double expected_fps_snapshot = static_cast<double>(NANOSECS_IN_SEC) / expected_frame_ns_snapshot;
+          const double fps_floor = expected_fps_snapshot * kNcplayerFpsFloorRatio;
+          const bool fps_is_low = marsh->current_fps > 0.0 && marsh->current_fps < fps_floor;
+          if(fps_is_low && !marsh->fps_below_target){
+            logwarn("[fps] %.2f FPS below %.0f%% of expected %.2f FPS (frame %06d, drops %.1f%%)",
+                    marsh->current_fps, kNcplayerFpsFloorRatio * 100.0, expected_fps_snapshot,
+                    marsh->framecount, marsh->current_drop_pct);
+            marsh->fps_below_target = true;
+          }else if(!fps_is_low && marsh->fps_below_target){
+            loginfo("[fps] recovered to %.2f FPS (expected %.2f FPS)",
+                    marsh->current_fps, expected_fps_snapshot);
+            marsh->fps_below_target = false;
+          }
+        }
       }
       frames_since_sample = 0;
       last_fps_sample = now;
@@ -256,8 +275,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     }
   }
   marsh->last_abstime_ns = target_ns;
-  const uint64_t default_frame_ns = 41666667ull; // ~24fps
-  const uint64_t expected_frame_ns = marsh->avg_frame_ns ? marsh->avg_frame_ns : default_frame_ns;
+  const uint64_t expected_frame_ns = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
 
   struct timespec nowts;
   clock_gettime(CLOCK_MONOTONIC, &nowts);
@@ -265,6 +283,11 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   int64_t lag_ns = (int64_t)now_ns - (int64_t)target_ns;
   const uint64_t drop_threshold_ns = expected_frame_ns * 3 / 2; // drop once 1.5 frames behind
   if(lag_ns > (int64_t)drop_threshold_ns){
+    const double lag_ms = static_cast<double>(lag_ns) / 1e6;
+    const double threshold_ms = static_cast<double>(drop_threshold_ns) / 1e6;
+    const double expected_ms = static_cast<double>(expected_frame_ns) / 1e6;
+    logwarn("[frame-drop] frame %06d lagged %.2fms > %.2fms threshold (expected frame %.2fms)",
+            marsh->framecount, lag_ms, threshold_ms, expected_ms);
     marsh->dropped_frames++;
     return 0;
   }
@@ -937,6 +960,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .show_fps = show_fps_overlay,
         .current_fps = 0.0,
         .current_drop_pct = 0.0,
+        .fps_below_target = false,
         .request = PlaybackRequest::None,
         .seek_delta = 0.0,
         .seek_absolute = false,
