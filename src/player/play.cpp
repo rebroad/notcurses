@@ -157,6 +157,7 @@ struct marshal {
   double current_fps;
   double current_drop_pct;
   bool fps_below_target;
+  int av_sync_state; // -1 audio ahead, 0 ok, 1 video ahead
   PlaybackRequest request;
   double seek_delta;
   bool seek_absolute;
@@ -276,6 +277,31 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   }
   marsh->last_abstime_ns = target_ns;
   const uint64_t expected_frame_ns = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
+  audio_output* global_audio = audio_output_get_global();
+  if(global_audio != nullptr){
+    double audio_seconds = audio_output_get_clock(global_audio);
+    if(std::isfinite(audio_seconds)){
+      double video_seconds = static_cast<double>(display_ns) / 1e9;
+      double diff_seconds = video_seconds - audio_seconds;
+      double threshold_seconds = static_cast<double>(expected_frame_ns) * 1.5 / 1e9;
+      if(std::fabs(diff_seconds) > threshold_seconds){
+        int new_state = diff_seconds > 0.0 ? 1 : -1;
+        if(marsh->av_sync_state != new_state){
+          double diff_ms = diff_seconds * 1e3;
+          double threshold_ms = threshold_seconds * 1e3;
+          const char* relation = diff_seconds > 0.0 ? "ahead of" : "behind";
+          logwarn("[av-sync] video %.2fms %s audio (threshold %.2fms, frame %06d)",
+                  std::fabs(diff_ms), relation, threshold_ms, marsh->framecount);
+          marsh->av_sync_state = new_state;
+        }
+      }else if(marsh->av_sync_state != 0){
+        double diff_ms = diff_seconds * 1e3;
+        loginfo("[av-sync] recovered (delta %.2fms, frame %06d)",
+                diff_ms, marsh->framecount);
+        marsh->av_sync_state = 0;
+      }
+    }
+  }
 
   struct timespec nowts;
   clock_gettime(CLOCK_MONOTONIC, &nowts);
@@ -961,6 +987,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .current_fps = 0.0,
         .current_drop_pct = 0.0,
         .fps_below_target = false,
+        .av_sync_state = 0,
         .request = PlaybackRequest::None,
         .seek_delta = 0.0,
         .seek_absolute = false,
