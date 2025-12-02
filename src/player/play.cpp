@@ -1327,7 +1327,18 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       }
       show_fps_overlay = marsh.show_fps;
       // Preserve pause state across stream restarts
+      bool was_paused = is_paused;
       is_paused = marsh.is_paused;
+      // If we just unpaused and audio thread wasn't started (because we were paused during seek),
+      // start it now so audio can play
+      if(was_paused && !is_paused && ffmpeg_has_audio(*ncv) && audio_thread == nullptr && ao != nullptr){
+        const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
+        logdebug("[audio] starting audio thread after unpause (media %.3fs)", audio_pos);
+        audio_running = true;
+        audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
+        audio_thread = new std::thread(audio_thread_func, audio_data);
+        audio_output_start(ao);
+      }
       if(audio_thread && !preserve_audio){
         const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
         const int iter = stream_iteration - 1;
