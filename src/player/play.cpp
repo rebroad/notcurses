@@ -172,6 +172,10 @@ struct marshal {
   double last_displayed_video_seconds; // video position of last actually displayed frame (for AV-sync)
   int consecutive_video_ahead_count; // count of consecutive frames where video is ahead of audio
   bool is_paused; // current pause state
+  // Cumulative statistics for FPS calculation across resizes
+  double* cumulative_play_time_seconds; // pointer to cumulative play time (excluding pause)
+  std::chrono::steady_clock::time_point* play_start_time; // when current play session started
+  bool* play_time_tracking_active; // whether we're currently tracking play time
 };
 
 static constexpr double kNcplayerSeekSeconds = 5.0;
@@ -261,43 +265,67 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   }
 
   std::unique_ptr<Plane> stdn(nc.get_stdplane());
-  static auto last_fps_sample = std::chrono::steady_clock::now();
-  static int frames_since_sample = 0;
   // negative framecount means don't print framecount/timing (quiet mode)
   if(marsh->framecount >= 0){
-    ++frames_since_sample;
     int64_t idx = ncvisual_frame_index(ncv);
     if(idx >= 0){
       marsh->framecount = idx;
     }else{
       ++marsh->framecount;
     }
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_fps_sample).count();
-    if(elapsed >= 1000){
-      if(elapsed > 0){
-        marsh->current_fps = frames_since_sample * 1000.0 / elapsed;
-        const uint64_t total_attempted = marsh->framecount + marsh->dropped_frames;
-        marsh->current_drop_pct = total_attempted ? (100.0 * marsh->dropped_frames / total_attempted) : 0.0;
-        const uint64_t expected_frame_ns_snapshot = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
-        if(expected_frame_ns_snapshot > 0){
-          const double expected_fps_snapshot = static_cast<double>(NANOSECS_IN_SEC) / expected_frame_ns_snapshot;
-          const double fps_floor = expected_fps_snapshot * kNcplayerFpsFloorRatio;
-          const bool fps_is_low = marsh->current_fps > 0.0 && marsh->current_fps < fps_floor;
-          if(fps_is_low && !marsh->fps_below_target){
-            logwarn("[fps] %.2f FPS below %.0f%% of expected %.2f FPS (frame %06d, drops %.1f%%)",
-                    marsh->current_fps, kNcplayerFpsFloorRatio * 100.0, expected_fps_snapshot,
-                    marsh->framecount, marsh->current_drop_pct);
-            marsh->fps_below_target = true;
-          }else if(!fps_is_low && marsh->fps_below_target){
-            loginfo("[fps] recovered to %.2f FPS (expected %.2f FPS)",
-                    marsh->current_fps, expected_fps_snapshot);
-            marsh->fps_below_target = false;
-          }
+
+    // Track play time for FPS calculation (only when not paused)
+    if(marsh->cumulative_play_time_seconds && marsh->play_start_time && marsh->play_time_tracking_active){
+      if(!marsh->is_paused){
+        // We're playing - track time
+        if(!*marsh->play_time_tracking_active){
+          // Just started playing - record start time
+          *marsh->play_start_time = std::chrono::steady_clock::now();
+          *marsh->play_time_tracking_active = true;
+        }
+        // Calculate elapsed play time for this session
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *marsh->play_start_time).count();
+        double current_session_play_time = elapsed / 1000.0;
+        double total_play_time = *marsh->cumulative_play_time_seconds + current_session_play_time;
+
+        // Calculate FPS from total frames / total play time
+        if(total_play_time > 0.0){
+          marsh->current_fps = marsh->framecount / total_play_time;
+        }
+      }else{
+        // We're paused - accumulate current session time and stop tracking
+        if(*marsh->play_time_tracking_active){
+          auto now = std::chrono::steady_clock::now();
+          auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *marsh->play_start_time).count();
+          double session_play_time = elapsed / 1000.0;
+          *marsh->cumulative_play_time_seconds += session_play_time;
+          *marsh->play_time_tracking_active = false;
+        }
+        // FPS remains at last calculated value while paused
+      }
+
+      // Calculate drop percentage from cumulative values
+      const uint64_t total_attempted = marsh->framecount + marsh->dropped_frames;
+      marsh->current_drop_pct = total_attempted ? (100.0 * marsh->dropped_frames / total_attempted) : 0.0;
+
+      // Check if FPS is below target
+      const uint64_t expected_frame_ns_snapshot = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
+      if(expected_frame_ns_snapshot > 0){
+        const double expected_fps_snapshot = static_cast<double>(NANOSECS_IN_SEC) / expected_frame_ns_snapshot;
+        const double fps_floor = expected_fps_snapshot * kNcplayerFpsFloorRatio;
+        const bool fps_is_low = marsh->current_fps > 0.0 && marsh->current_fps < fps_floor;
+        if(fps_is_low && !marsh->fps_below_target){
+          logwarn("[fps] %.2f FPS below %.0f%% of expected %.2f FPS (frame %06d, drops %.1f%%)",
+                  marsh->current_fps, kNcplayerFpsFloorRatio * 100.0, expected_fps_snapshot,
+                  marsh->framecount, marsh->current_drop_pct);
+          marsh->fps_below_target = true;
+        }else if(!fps_is_low && marsh->fps_below_target){
+          loginfo("[fps] recovered to %.2f FPS (expected %.2f FPS)",
+                  marsh->current_fps, expected_fps_snapshot);
+          marsh->fps_below_target = false;
         }
       }
-      frames_since_sample = 0;
-      last_fps_sample = now;
     }
   }
   stdn->set_fg_rgb(0x80c080);
@@ -1264,6 +1292,10 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
     int cumulative_framecount = 0;
     // Preserve pause state across seeks/resizes
     bool is_paused = false;
+    // Track total play time (excluding pause time) for FPS calculation
+    double cumulative_play_time_seconds = 0.0;
+    std::chrono::steady_clock::time_point play_start_time;
+    bool play_time_tracking_active = false;
     while(true){
       logdebug("[stream] begin iteration %d (need_recreate=%d, audio=%d)", stream_iteration++, needs_plane_recreate ? 1 : 0, audio_thread ? 1 : 0);
       bool restart_stream = false;
@@ -1331,6 +1363,23 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         }
       }
 
+      // If we're resuming play after a pause, accumulate the play time from before pause
+      if(!is_paused && play_time_tracking_active){
+        // We were playing before, continue tracking
+        // play_start_time is already set
+      }else if(!is_paused && !play_time_tracking_active){
+        // Starting to play - begin tracking
+        play_start_time = std::chrono::steady_clock::now();
+        play_time_tracking_active = true;
+      }else if(is_paused && play_time_tracking_active){
+        // Just paused - accumulate current session time
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - play_start_time).count();
+        double session_play_time = elapsed / 1000.0;
+        cumulative_play_time_seconds += session_play_time;
+        play_time_tracking_active = false;
+      }
+
       struct marshal marsh = {
         .framecount = cumulative_framecount,
         .quiet = quiet,
@@ -1353,6 +1402,9 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .last_displayed_video_seconds = -1.0,
         .consecutive_video_ahead_count = 0,
         .is_paused = is_paused,
+        .cumulative_play_time_seconds = &cumulative_play_time_seconds,
+        .play_start_time = &play_start_time,
+        .play_time_tracking_active = &play_time_tracking_active,
       };
       // Set up wrapper structure to pass drop check callback and original curry
       struct ncplayer_stream_curry stream_curry = {
@@ -1365,6 +1417,14 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       // Preserve drop statistics before processing requests
       cumulative_dropped_frames = marsh.dropped_frames;
       cumulative_framecount = marsh.framecount;
+      // Accumulate play time if we were tracking and are now pausing
+      if(marsh.is_paused && play_time_tracking_active){
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - play_start_time).count();
+        double session_play_time = elapsed / 1000.0;
+        cumulative_play_time_seconds += session_play_time;
+        play_time_tracking_active = false;
+      }
       pending_request = marsh.request;
       if(pending_request == PlaybackRequest::Seek){
         pending_seek_value = marsh.seek_delta;
@@ -1428,6 +1488,12 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       // Only stop/destroy audio if we're restarting the stream (r == 2) and not preserving audio
       // Don't destroy if we just started the thread (we want to keep it running)
       // CRITICAL: Stop the thread BEFORE destroying the audio output to prevent use-after-free
+      // Also check if a seek is pending - if so, preserve audio to avoid losing the clock position
+      bool seek_pending = (pending_request == PlaybackRequest::Seek);
+      if(seek_pending){
+        preserve_audio = true;
+        logdebug("[seek] preserving audio for pending seek operation");
+      }
       if(audio_thread && !preserve_audio && r == 2 && !just_started_audio){
         const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
         const int iter = stream_iteration - 1;
@@ -1467,8 +1533,8 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         audio_output_destroy(ao);
         ao = nullptr;
       }
-      if(preserve_audio){
-        logdebug("[resize] preserving audio thread during resize restart");
+      if(preserve_audio && !seek_pending){
+        logdebug("[resize] preserving audio thread during resize restart, clearing preserve flag");
         preserve_audio = false;
       }
 
@@ -1509,9 +1575,16 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
           pending_request = PlaybackRequest::None;
           restart_stream = true;
           pending_seek_value = 0.0;
-          // Preserve audio during seeks to avoid destroying the output while thread is running
-          // This prevents crashes when the audio thread tries to write to a destroyed buffer
-          preserve_audio = true;
+          // preserve_audio is already set above before the seek
+          // Now update the audio clock to match the new video position
+          if(ao && preserve_audio){
+            double new_audio_pos = actual_pos;
+            if(std::isfinite(new_audio_pos) && new_audio_pos >= 0.0){
+              audio_output_set_pts(ao, static_cast<uint64_t>(new_audio_pos * 1e9), 1e-9);
+              double verify_clock = audio_output_get_clock(ao);
+              logdebug("[seek] updated audio clock to %.3fs (verified: %.3fs) after seek", new_audio_pos, verify_clock);
+            }
+          }
           if(was_absolute){
             needs_plane_recreate = true;
           }
