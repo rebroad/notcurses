@@ -1371,26 +1371,31 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       stdn->set_userptr(nullptr);
       restart_stream = false;
       if(pending_request == PlaybackRequest::Seek){
+        double from_pos = ffmpeg_get_video_position_seconds(*ncv);
+        if(!std::isfinite(from_pos)){
+          from_pos = 0.0;
+        }
         double delta = pending_seek_value;
         bool was_absolute = pending_seek_absolute;
+        double to_pos = from_pos;
         if(pending_seek_absolute){
-          double current = ffmpeg_get_video_position_seconds(*ncv);
-          if(!std::isfinite(current)){
-            current = 0.0;
-          }
-          delta = pending_seek_value - current;
+          to_pos = pending_seek_value;
+          delta = pending_seek_value - from_pos;
           pending_seek_absolute = false;
+        }else{
+          to_pos = from_pos + delta;
         }
         if(marsh.resize_restart_pending){
           logdebug("[resize] clearing pending restart");
           marsh.resize_restart_pending = false;
         }
-        logdebug("[seek] request delta=%f (absolute=%d)", delta, was_absolute ? 1 : 0);
+        logdebug("[seek] from %.3fs to %.3fs (delta=%.3fs, absolute=%d)", from_pos, to_pos, delta, was_absolute ? 1 : 0);
         if(ncvisual_seek(*ncv, delta) == 0){
+          double actual_pos = ffmpeg_get_video_position_seconds(*ncv);
+          logdebug("[seek] success, actual position %.3fs", actual_pos);
           pending_request = PlaybackRequest::None;
           restart_stream = true;
           pending_seek_value = 0.0;
-          logdebug("[seek] success");
           if(was_absolute){
             needs_plane_recreate = true;
             preserve_audio = true;
