@@ -520,14 +520,15 @@ subtitle_plane_from_text(ncplane* parent, const char* text, bool* logged_flag){
     free(dup);
     return NULL;
   }
-  int maxwidth = 0;
   char* walker = trimmed;
   size_t offset = 0;
   size_t* line_offsets = malloc(sizeof(*line_offsets) * linecount);
   size_t* line_lengths = malloc(sizeof(*line_lengths) * linecount);
-  if(line_offsets == NULL || line_lengths == NULL){
+  int* line_widths = malloc(sizeof(*line_widths) * linecount);
+  if(line_offsets == NULL || line_lengths == NULL || line_widths == NULL){
     free(line_offsets);
     free(line_lengths);
+    free(line_widths);
     free(style_map);
     free(dup);
     return NULL;
@@ -543,15 +544,13 @@ subtitle_plane_from_text(ncplane* parent, const char* text, bool* logged_flag){
       if(line != linecount - 1){
         free(line_offsets);
         free(line_lengths);
+        free(line_widths);
         free(style_map);
         free(dup);
         return NULL;
       }
     }
-    int w = ncstrwidth(walker, NULL, NULL);
-    if(w > maxwidth){
-      maxwidth = w;
-    }
+    line_widths[line] = ncstrwidth(walker, NULL, NULL);
     if(next){
       *next = '\n';
       walker = next + 1;
@@ -561,58 +560,72 @@ subtitle_plane_from_text(ncplane* parent, const char* text, bool* logged_flag){
       break;
     }
   }
-  if(maxwidth <= 0){
-    free(line_offsets);
-    free(line_lengths);
-    free(style_map);
-    free(dup);
-    return NULL;
-  }
-  int cols = maxwidth;
-  if(cols > parent_cols){
-    cols = parent_cols;
-  }
-  int xpos = (parent_cols - cols) / 2;
-
-  struct ncplane_options nopts = {
-    .y = ncplane_dim_y(parent) - (linecount + 1),
-    .x = xpos,
+  // Create a minimal parent plane to hold the subtitle lines
+  // This plane won't create any visible cells - it's just a container
+  int parent_y = ncplane_dim_y(parent);
+  struct ncplane_options parent_opts = {
+    .y = parent_y - (linecount + 1),
+    .x = 0,
     .rows = linecount,
-    .cols = cols,
+    .cols = 1,
     .name = "subt",
   };
-  struct ncplane* n = ncplane_create(parent, &nopts);
-  if(n == NULL){
+  struct ncplane* parent_plane = ncplane_create(parent, &parent_opts);
+  if(parent_plane == NULL){
     free(line_offsets);
     free(line_lengths);
+    free(line_widths);
     free(style_map);
     free(dup);
     return NULL;
   }
-  uint64_t channels = 0;
-  ncchannels_set_fg_rgb8(&channels, 0xff, 0xff, 0xff);
-  ncchannels_set_fg_alpha(&channels, NCALPHA_OPAQUE);
-  ncchannels_set_bg_rgb8(&channels, 0x20, 0x20, 0x20);
-  ncchannels_set_bg_alpha(&channels, NCALPHA_BLEND);
-  ncplane_set_base(n, " ", 0, channels);
+  // Make parent plane completely transparent
+  uint64_t transparent_channels = 0;
+  ncchannels_set_fg_alpha(&transparent_channels, NCALPHA_TRANSPARENT);
+  ncchannels_set_bg_alpha(&transparent_channels, NCALPHA_TRANSPARENT);
+  ncplane_set_base(parent_plane, " ", 0, transparent_channels);
 
-  ncplane_set_fg_rgb8(n, 0xff, 0xff, 0xff);
-  ncplane_set_fg_alpha(n, NCALPHA_OPAQUE);
-  ncplane_set_bg_rgb8(n, 0x20, 0x20, 0x20);
-  ncplane_set_bg_alpha(n, NCALPHA_BLEND);
   if(logged_flag && !*logged_flag){
     SUBLOG_DEBUG("rendering subtitle text (raw): \"%s\"", raw);
     SUBLOG_DEBUG("rendering subtitle text (trimmed): \"%s\"", trimmed);
     *logged_flag = true;
   }
+  // Create individual planes for each line, each only as wide as needed
   for(int line = 0 ; line < linecount ; ++line){
     size_t line_len = line_lengths[line];
     if(line_len == 0){
       continue;
     }
+    int line_width = line_widths[line];
+    if(line_width <= 0){
+      continue;
+    }
+    // Center this line individually based on its own width
+    int line_xpos = (parent_cols - line_width) / 2;
+    if(line_xpos < 0){
+      line_xpos = 0;
+    }
+    // Create a plane for this line, only as wide as the text
+    struct ncplane_options line_opts = {
+      .y = line,
+      .x = line_xpos,
+      .rows = 1,
+      .cols = line_width,
+      .name = "subtline",
+    };
+    struct ncplane* line_plane = ncplane_create(parent_plane, &line_opts);
+    if(line_plane == NULL){
+      continue;
+    }
+    // Set background color for this line
+    ncplane_set_bg_rgb8(line_plane, 0x20, 0x20, 0x20);
+    ncplane_set_bg_alpha(line_plane, NCALPHA_BLEND);
+    ncplane_set_fg_rgb8(line_plane, 0xff, 0xff, 0xff);
+    ncplane_set_fg_alpha(line_plane, NCALPHA_OPAQUE);
+    // Render the text directly - background will only be where text exists
     size_t base = line_offsets[line];
     size_t cursor = 0;
-    int line_xpos = 0;
+    int text_xpos = 0;
     while(cursor < line_len){
       bool italic = style_map[base + cursor];
       size_t chunk_end = cursor + 1;
@@ -622,21 +635,23 @@ subtitle_plane_from_text(ncplane* parent, const char* text, bool* logged_flag){
       char saved = trimmed[base + chunk_end];
       trimmed[base + chunk_end] = '\0';
       if(italic){
-        ncplane_set_fg_rgb8(n, 0xff, 0xff, 0x00);
+        ncplane_set_fg_rgb8(line_plane, 0xff, 0xff, 0x00);
       }else{
-        ncplane_set_fg_rgb8(n, 0xff, 0xff, 0xff);
+        ncplane_set_fg_rgb8(line_plane, 0xff, 0xff, 0xff);
       }
-      ncplane_putstr_yx(n, line, line_xpos, trimmed + base + cursor);
-      line_xpos += ncstrwidth(trimmed + base + cursor, NULL, NULL);
+      // Background is already set above, will apply to text cells
+      ncplane_putstr_yx(line_plane, 0, text_xpos, trimmed + base + cursor);
+      text_xpos += ncstrwidth(trimmed + base + cursor, NULL, NULL);
       trimmed[base + chunk_end] = saved;
       cursor = chunk_end;
     }
   }
   free(line_offsets);
   free(line_lengths);
+  free(line_widths);
   free(style_map);
   free(dup);
-  return n;
+  return parent_plane;
 }
 
 static uint32_t palette[NCPALETTESIZE];
