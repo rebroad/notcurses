@@ -160,7 +160,7 @@ struct marshal {
   bool show_fps;
   double current_fps;
   double current_drop_pct;
-  bool fps_below_target;
+  bool fps_off_target;
   int av_sync_state; // -1 audio ahead, 0 ok, 1 video ahead
   PlaybackRequest request;
   double seek_delta;
@@ -329,21 +329,56 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         }
       }
 
-      // Check if FPS is below target
+      // Check if FPS is below or above target
       const uint64_t expected_frame_ns_snapshot = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
       if(expected_frame_ns_snapshot > 0){
         const double expected_fps_snapshot = static_cast<double>(NANOSECS_IN_SEC) / expected_frame_ns_snapshot;
         const double fps_floor = expected_fps_snapshot * kNcplayerFpsFloorRatio;
+        const double fps_ceiling = expected_fps_snapshot * 1.10; // 110% of expected
         const bool fps_is_low = marsh->current_fps > 0.0 && marsh->current_fps < fps_floor;
-        if(fps_is_low && !marsh->fps_below_target){
-          logwarn("[fps] %.2f FPS below %.0f%% of expected %.2f FPS (frame %06d, drops %.1f%%)",
-                  marsh->current_fps, kNcplayerFpsFloorRatio * 100.0, expected_fps_snapshot,
-                  marsh->framecount, marsh->current_drop_pct);
-          marsh->fps_below_target = true;
-        }else if(!fps_is_low && marsh->fps_below_target){
-          loginfo("[fps] recovered to %.2f FPS (expected %.2f FPS)",
-                  marsh->current_fps, expected_fps_snapshot);
-          marsh->fps_below_target = false;
+        const bool fps_is_high = marsh->current_fps > fps_ceiling;
+
+        // DRY: Helper for play time tracking
+        auto get_total_play_time_for_log = [&]() -> double {
+          double t = 0.0;
+          if(marsh->cumulative_play_time_seconds && marsh->play_start_time && marsh->play_time_tracking_active){
+            if(!marsh->is_paused && *marsh->play_time_tracking_active){
+              auto now = std::chrono::steady_clock::now();
+              auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *marsh->play_start_time).count();
+              double current_session_play_time = elapsed / 1000.0;
+              t = *marsh->cumulative_play_time_seconds + current_session_play_time;
+            }else{
+              t = *marsh->cumulative_play_time_seconds;
+            }
+          }
+          return t;
+        };
+        double total_play_time_for_log = get_total_play_time_for_log();
+
+        // FPS off-target transition logic
+        if(fps_is_low || fps_is_high){
+          if(!marsh->fps_off_target){
+            if(fps_is_low){
+              logwarn("[fps] %.2f FPS below %.0f%% of expected %.2f FPS (frame %06d, drops %.1f%%, "
+                      "calculated from %d frames / %.3fs play time)",
+                      marsh->current_fps, kNcplayerFpsFloorRatio * 100.0, expected_fps_snapshot,
+                      marsh->framecount, marsh->current_drop_pct,
+                      marsh->framecount, total_play_time_for_log);
+            }else{
+              logwarn("[fps] %.2f FPS above 110%% of expected %.2f FPS (frame %06d, drops %.1f%%, "
+                      "calculated from %d frames / %.3fs play time)",
+                      marsh->current_fps, expected_fps_snapshot,
+                      marsh->framecount, marsh->current_drop_pct,
+                      marsh->framecount, total_play_time_for_log);
+            }
+            marsh->fps_off_target = true;
+          }
+        }else if(marsh->fps_off_target){
+          loginfo("[fps] returned to normal %.2f FPS (expected %.2f FPS, "
+                  "calculated from %d frames / %.3fs play time)",
+                  marsh->current_fps, expected_fps_snapshot,
+                  marsh->framecount, total_play_time_for_log);
+          marsh->fps_off_target = false;
         }
       }
     }
@@ -1410,7 +1445,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .show_fps = show_fps_overlay,
         .current_fps = 0.0,
         .current_drop_pct = 0.0,
-        .fps_below_target = false,
+        .fps_off_target = false,
         .av_sync_state = 0,
         .request = PlaybackRequest::None,
         .seek_delta = 0.0,
