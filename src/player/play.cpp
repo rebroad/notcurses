@@ -166,6 +166,7 @@ struct marshal {
   std::atomic<int>* volume_percent;
   std::chrono::steady_clock::time_point volume_overlay_until;
   uint64_t timing_offset_ns;  // offset to apply to wall clock for lag calculations (set on unpause)
+  double last_displayed_video_seconds; // video position of last actually displayed frame (for AV-sync)
 };
 
 static constexpr double kNcplayerSeekSeconds = 5.0;
@@ -312,17 +313,21 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   }
   marsh->last_abstime_ns = target_ns;
   const uint64_t expected_frame_ns = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
-  // AV-sync tracking and frame dropping: drops frames when video is behind audio by 1 frame
-  // or more in media time. This is the only reason we drop frames - we don't care about
-  // render lag (wall clock vs scheduled time).
+  // AV-sync tracking and frame dropping: drops frames when video is behind audio by 1.5 frames
+  // or more in media time. We compare using the last DISPLAYED frame position, not the current
+  // frame position, so that dropped frames don't affect the comparison.
+  double current_video_seconds = static_cast<double>(display_ns) / 1e9;
   bool should_drop_frame = false;
   audio_output* global_audio = audio_output_get_global();
+  double threshold_seconds = static_cast<double>(expected_frame_ns) * 1.5 / 1e9;
   if(global_audio != nullptr){
     double audio_seconds = audio_output_get_clock(global_audio);
     if(std::isfinite(audio_seconds) && audio_seconds > 0.0){
-      double video_seconds = static_cast<double>(display_ns) / 1e9;
+      // Use last displayed position for comparison, or current frame position if no frame displayed yet
+      double video_seconds = marsh->last_displayed_video_seconds >= 0.0
+                             ? marsh->last_displayed_video_seconds
+                             : current_video_seconds;
       double diff_seconds = video_seconds - audio_seconds;
-      double threshold_seconds = static_cast<double>(expected_frame_ns) / 1e9;
 
       // Drop frame if video is behind audio by threshold or more
       if(diff_seconds <= -threshold_seconds){
@@ -336,33 +341,43 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
                 video_stamp.c_str(), audio_stamp.c_str());
       }
 
-      // Track AV-sync state for logging
-      if(std::fabs(diff_seconds) > threshold_seconds){
-        int new_state = diff_seconds > 0.0 ? 1 : -1;
-        if(marsh->av_sync_state != new_state){
-          double diff_ms = diff_seconds * 1e3;
-          double threshold_ms = threshold_seconds * 1e3;
-          const char* issue = diff_seconds > 0.0 ? "audio behind video" : "video behind audio";
-          const std::string video_stamp = format_hms(video_seconds);
+      // Track AV-sync state for logging (only if we're not dropping this frame)
+      // Use the position we'd use for display (last displayed or current if first frame)
+      if(!should_drop_frame){
+        double video_pos_for_sync = marsh->last_displayed_video_seconds >= 0.0
+                                     ? marsh->last_displayed_video_seconds
+                                     : current_video_seconds;
+        double current_diff = video_pos_for_sync - audio_seconds;
+        if(std::fabs(current_diff) > threshold_seconds){
+          int new_state = current_diff > 0.0 ? 1 : -1;
+          if(marsh->av_sync_state != new_state){
+            double diff_ms = current_diff * 1e3;
+            double threshold_ms = threshold_seconds * 1e3;
+            const char* issue = current_diff > 0.0 ? "audio behind video" : "video behind audio";
+            const std::string video_stamp = format_hms(video_pos_for_sync);
+            const std::string audio_stamp = format_hms(audio_seconds);
+            logwarn("[av-sync] %s by %.2fms (threshold %.2fms, frame %06d, video@%s, audio@%s)",
+                    issue, std::fabs(diff_ms), threshold_ms, marsh->framecount,
+                    video_stamp.c_str(), audio_stamp.c_str());
+            marsh->av_sync_state = new_state;
+          }
+        }else if(marsh->av_sync_state != 0){
+          double diff_ms = current_diff * 1e3;
+          const std::string video_stamp = format_hms(video_pos_for_sync);
           const std::string audio_stamp = format_hms(audio_seconds);
-          logwarn("[av-sync] %s by %.2fms (threshold %.2fms, frame %06d, video@%s, audio@%s)",
-                  issue, std::fabs(diff_ms), threshold_ms, marsh->framecount,
-                  video_stamp.c_str(), audio_stamp.c_str());
-          marsh->av_sync_state = new_state;
+          loginfo("[av-sync] drift within threshold (drift %.2fms, frame %06d, video@%s, audio@%s)",
+                  diff_ms, marsh->framecount, video_stamp.c_str(), audio_stamp.c_str());
+          marsh->av_sync_state = 0;
         }
-      }else if(marsh->av_sync_state != 0){
-        double diff_ms = diff_seconds * 1e3;
-        const std::string video_stamp = format_hms(video_seconds);
-        const std::string audio_stamp = format_hms(audio_seconds);
-        loginfo("[av-sync] drift within threshold (drift %.2fms, frame %06d, video@%s, audio@%s)",
-                diff_ms, marsh->framecount, video_stamp.c_str(), audio_stamp.c_str());
-        marsh->av_sync_state = 0;
       }
     }
   }
 
   if(should_drop_frame){
     marsh->dropped_frames++;
+    // Even when dropping, advance the tracked video position to the current frame
+    // so we don't get stuck comparing against an old position
+    marsh->last_displayed_video_seconds = current_video_seconds;
     return 0;
   }
 
@@ -592,11 +607,12 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     }else if(keyp != 'q'){
       continue;
     }
-      destroy_subtitle_plane();
+    destroy_subtitle_plane();
     return 1;
   }
-    destroy_subtitle_plane();
   destroy_subtitle_plane();
+  // Frame was successfully displayed - update last displayed position
+  marsh->last_displayed_video_seconds = current_video_seconds;
   return 0;
 }
 
@@ -1098,6 +1114,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .volume_percent = &volume_percent,
         .volume_overlay_until = std::chrono::steady_clock::time_point::min(),
         .timing_offset_ns = 0,
+        .last_displayed_video_seconds = -1.0,
       };
       logdebug("[stream] starting ncvisual_stream iteration with %ux%u plane", vopts.n ? ncplane_dim_x(vopts.n) : 0, vopts.n ? ncplane_dim_y(vopts.n) : 0);
       r = ncv->stream(&vopts, timescale, perframe, &marsh);
