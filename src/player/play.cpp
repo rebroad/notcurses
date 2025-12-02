@@ -167,6 +167,7 @@ struct marshal {
   std::chrono::steady_clock::time_point volume_overlay_until;
   uint64_t timing_offset_ns;  // offset to apply to wall clock for lag calculations (set on unpause)
   double last_displayed_video_seconds; // video position of last actually displayed frame (for AV-sync)
+  int consecutive_video_ahead_count; // count of consecutive frames where video is ahead of audio
 };
 
 static constexpr double kNcplayerSeekSeconds = 5.0;
@@ -360,6 +361,13 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
                     issue, std::fabs(diff_ms), threshold_ms, marsh->framecount,
                     video_stamp.c_str(), audio_stamp.c_str());
             marsh->av_sync_state = new_state;
+            marsh->consecutive_video_ahead_count = 0; // Reset counter on state change
+          }
+          // Track consecutive frames where video is ahead of audio by threshold
+          if(marsh->av_sync_state == 1 && current_diff > threshold_seconds){
+            marsh->consecutive_video_ahead_count++;
+          }else{
+            marsh->consecutive_video_ahead_count = 0;
           }
         }else if(marsh->av_sync_state != 0){
           double diff_ms = current_diff * 1e3;
@@ -368,6 +376,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
           loginfo("[av-sync] drift within threshold (drift %.2fms, frame %06d, video@%s, audio@%s)",
                   diff_ms, marsh->framecount, video_stamp.c_str(), audio_stamp.c_str());
           marsh->av_sync_state = 0;
+          marsh->consecutive_video_ahead_count = 0; // Reset counter when in sync
         }
       }
     }
@@ -379,6 +388,31 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     // so we don't get stuck comparing against an old position
     marsh->last_displayed_video_seconds = current_video_seconds;
     return 0;
+  }
+
+  // Sleep to let audio catch up if video has been ahead for 2 consecutive frames
+  if(marsh->consecutive_video_ahead_count > 1 && global_audio != nullptr){
+    double audio_seconds = audio_output_get_clock(global_audio);
+    if(std::isfinite(audio_seconds) && audio_seconds > 0.0){
+      double video_pos = marsh->last_displayed_video_seconds >= 0.0
+                         ? marsh->last_displayed_video_seconds
+                         : current_video_seconds;
+      double diff_seconds = video_pos - audio_seconds;
+      if(diff_seconds > threshold_seconds){
+        // Sleep for half the drift amount to gradually let audio catch up
+        uint64_t sleep_ns = (uint64_t)((diff_seconds * 0.5) * 1e9);
+        // Cap sleep at 1 frame interval to avoid huge delays
+        uint64_t max_sleep_ns = expected_frame_ns;
+        if(sleep_ns > max_sleep_ns){
+          sleep_ns = max_sleep_ns;
+        }
+        struct timespec sleep_ts;
+        ns_to_timespec(sleep_ns, &sleep_ts);
+        loginfo("[av-sync] sleeping %.2fms to let audio catch up (video ahead by %.2fms, frame %06d)",
+                static_cast<double>(sleep_ns) / 1e6, diff_seconds * 1e3, marsh->framecount);
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_ts, NULL);
+      }
+    }
   }
 
   // Sleep if we're ahead of schedule (based on wall clock vs scheduled frame time)
@@ -1115,6 +1149,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .volume_overlay_until = std::chrono::steady_clock::time_point::min(),
         .timing_offset_ns = 0,
         .last_displayed_video_seconds = -1.0,
+        .consecutive_video_ahead_count = 0,
       };
       logdebug("[stream] starting ncvisual_stream iteration with %ux%u plane", vopts.n ? ncplane_dim_x(vopts.n) : 0, vopts.n ? ncplane_dim_y(vopts.n) : 0);
       r = ncv->stream(&vopts, timescale, perframe, &marsh);
