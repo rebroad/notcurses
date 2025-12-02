@@ -271,12 +271,9 @@ static int ncplayer_should_drop_frame_impl(struct ncvisual* ncv, void* curry, ui
     // Log the drop
     double diff_ms = diff_seconds * 1e3;
     double threshold_ms = threshold_seconds * 1e3;
-    const std::string video_stamp = format_hms(video_seconds);
-    const std::string audio_stamp = format_hms(audio_seconds);
     int framecount = marsh->framecount >= 0 ? marsh->framecount : 0;
-    logwarn("[frame-drop] video frame %06d: video behind audio by %.2fms, dropped (threshold %.2fms, video@%s, audio@%s)",
-            framecount, -diff_ms, threshold_ms,
-            video_stamp.c_str(), audio_stamp.c_str());
+    logwarn("[frame-drop] video frame %06d: video behind audio by %.2fms, dropped (threshold %.2fms)",
+            framecount, -diff_ms, threshold_ms);
     return 1; // Drop this frame
   }
 
@@ -410,12 +407,8 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         if(marsh->av_sync_state != new_state){
           double diff_ms = current_diff * 1e3;
           double threshold_ms = threshold_seconds * 1e3;
-          const char* issue = current_diff > 0.0 ? "audio behind video" : "video behind audio";
-          const std::string video_stamp = format_hms(video_pos_for_sync);
-          const std::string audio_stamp = format_hms(audio_seconds);
-          logwarn("[av-sync] %s by %.2fms (threshold %.2fms, frame %06d, video@%s, audio@%s)",
-                  issue, std::fabs(diff_ms), threshold_ms, marsh->framecount,
-                  video_stamp.c_str(), audio_stamp.c_str());
+          logwarn("[av-sync] >threshold %.2fms, frame %06d, audio offset %+.2fms",
+                  threshold_ms, marsh->framecount, diff_ms);
           marsh->av_sync_state = new_state;
           marsh->consecutive_video_ahead_count = 0; // Reset counter on state change
         }
@@ -427,10 +420,8 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         }
       }else if(marsh->av_sync_state != 0){
         double diff_ms = current_diff * 1e3;
-        const std::string video_stamp = format_hms(video_pos_for_sync);
-        const std::string audio_stamp = format_hms(audio_seconds);
-        loginfo("[av-sync] drift within threshold (drift %.2fms, frame %06d, video@%s, audio@%s)",
-                diff_ms, marsh->framecount, video_stamp.c_str(), audio_stamp.c_str());
+        loginfo("[av-sync] <threshold %.2fms, frame %06d, audio offset %+.2fms",
+                threshold_ms, marsh->framecount, diff_ms);
         marsh->av_sync_state = 0;
         marsh->consecutive_video_ahead_count = 0; // Reset counter when in sync
       }
