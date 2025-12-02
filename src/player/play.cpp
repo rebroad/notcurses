@@ -312,8 +312,8 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   }
   marsh->last_abstime_ns = target_ns;
   const uint64_t expected_frame_ns = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
-  // AV-sync tracking and frame dropping: drops frames when video is behind audio by more than
-  // 1.5 frames in media time. This is the only reason we drop frames - we don't care about
+  // AV-sync tracking and frame dropping: drops frames when video is behind audio by 1 frame
+  // or more in media time. This is the only reason we drop frames - we don't care about
   // render lag (wall clock vs scheduled time).
   bool should_drop_frame = false;
   audio_output* global_audio = audio_output_get_global();
@@ -322,7 +322,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     if(std::isfinite(audio_seconds) && audio_seconds > 0.0){
       double video_seconds = static_cast<double>(display_ns) / 1e9;
       double diff_seconds = video_seconds - audio_seconds;
-      double threshold_seconds = static_cast<double>(expected_frame_ns) * 1.5 / 1e9;
+      double threshold_seconds = static_cast<double>(expected_frame_ns) / 1e9;
 
       // Drop frame if video is behind audio by threshold or more
       if(diff_seconds <= -threshold_seconds){
