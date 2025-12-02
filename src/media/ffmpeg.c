@@ -46,6 +46,17 @@ struct AVPacket;
 
 double ffmpeg_get_video_position_seconds(const ncvisual* ncv);
 
+// Callback type for optional frame drop checking
+// Returns 1 if frame should be dropped (skip blit), 0 otherwise
+// Arguments: ncv (the visual), curry (original curry passed to stream), expected_frame_ns (frame duration in nanoseconds)
+typedef int (*ncplayer_drop_check_cb)(struct ncvisual* ncv, void* curry, uint64_t expected_frame_ns);
+
+// Wrapper structure to pass both callback and original curry through streamer curry parameter
+struct ncplayer_stream_curry {
+  ncplayer_drop_check_cb drop_check;
+  void* original_curry;
+};
+
 #define AUDIO_PACKET_QUEUE_SIZE 8
 #define IMGALLOCALIGN 64
 
@@ -1353,6 +1364,45 @@ ffmpeg_stream(notcurses* nc, ncvisual* ncv, float timescale,
       tbase = 0;
     }
 
+    // Check if curry is a wrapper structure with drop check callback
+    struct ncplayer_stream_curry* stream_curry = NULL;
+    void* original_curry = curry;
+    if(curry != NULL){
+      // Try to interpret curry as wrapper structure (check if it has drop_check callback)
+      stream_curry = (struct ncplayer_stream_curry*)curry;
+      // If drop_check is set, this is a wrapper structure
+      if(stream_curry->drop_check != NULL){
+        original_curry = stream_curry->original_curry;
+      }else{
+        stream_curry = NULL; // Not a wrapper, use curry as-is
+        original_curry = curry;
+      }
+    }
+
+    // Calculate expected frame duration for drop check
+    const uint64_t pktduration = ffmpeg_pkt_duration(ncv->details->frame);
+    uint64_t expected_frame_ns = pktduration * tbase * NANOSECS_IN_SEC;
+    if(expected_frame_ns == 0){
+      // Default to ~33ms (30fps) if we can't determine frame duration
+      expected_frame_ns = 33333333;
+    }
+
+    // Check if we should drop this frame BEFORE doing expensive blit work
+    bool should_drop = false;
+    if(stream_curry != NULL && stream_curry->drop_check != NULL){
+      if(stream_curry->drop_check(ncv, original_curry, expected_frame_ns)){
+        should_drop = true;
+      }
+    }
+
+    if(should_drop){
+      // Frame should be dropped - skip blit and callback, continue to next frame
+      // Still need to update sum_duration to keep timing in sync
+      uint64_t duration = expected_frame_ns;
+      sum_duration += (duration * timescale);
+      continue;
+    }
+
     if(activevopts.n){
       ncplane_erase(activevopts.n); // new frame could be partially transparent
     }
@@ -1372,18 +1422,18 @@ ffmpeg_stream(notcurses* nc, ncvisual* ncv, float timescale,
       activevopts.n = newn;
     }
     // display duration in units of time_base
-    const uint64_t pktduration = ffmpeg_pkt_duration(ncv->details->frame);
-    uint64_t duration = pktduration * tbase * NANOSECS_IN_SEC;
+    uint64_t duration = expected_frame_ns;
     double schedns = nsbegin;
     sum_duration += (duration * timescale);
     schedns += sum_duration;
     struct timespec abstime;
     ns_to_timespec(schedns, &abstime);
     int r;
+    // Pass original_curry to callback (already extracted from wrapper if needed)
     if(streamer){
-      r = streamer(ncv, &activevopts, &abstime, curry);
+      r = streamer(ncv, &activevopts, &abstime, original_curry);
     }else{
-      r = ncvisual_simple_streamer(ncv, &activevopts, &abstime, curry);
+      r = ncvisual_simple_streamer(ncv, &activevopts, &abstime, original_curry);
     }
     if(r){
       if(activevopts.n != vopts->n){

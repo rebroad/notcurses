@@ -46,6 +46,8 @@ void ffmpeg_audio_request_packets(ncvisual* ncv);
 void ffmpeg_set_audio_enabled(ncvisual* ncv, bool enabled);
 bool ffmpeg_is_audio_enabled(ncvisual* ncv);
 double ffmpeg_get_video_position_seconds(const ncvisual* ncv);
+// Forward declaration for wrapper structure
+struct ncplayer_stream_curry;
 }
 
 
@@ -212,9 +214,80 @@ format_hms(double seconds){
   return std::string(buf);
 }
 
+// C-compatible wrapper structure matching the one in ffmpeg.c
+extern "C" {
+struct ncplayer_stream_curry {
+  int (*drop_check)(struct ncvisual* ncv, void* curry, uint64_t expected_frame_ns);
+  void* original_curry;
+};
+}
+
+// C-compatible drop check function that can be called from ffmpeg.c
+// Returns 1 if frame should be dropped, 0 otherwise
+extern "C" {
+static int ncplayer_should_drop_frame_impl(struct ncvisual* ncv, void* curry, uint64_t expected_frame_ns){
+  if(curry == nullptr || ncv == nullptr){
+    return 0;
+  }
+  struct marshal* marsh = static_cast<struct marshal*>(curry);
+
+  double current_video_seconds = ffmpeg_get_video_position_seconds(ncv);
+  if(current_video_seconds < 0.0){
+    return 0; // Can't determine video position, don't drop
+  }
+
+  audio_output* global_audio = audio_output_get_global();
+  if(global_audio == nullptr){
+    return 0; // No audio, can't check AV-sync
+  }
+
+  double audio_seconds = audio_output_get_clock(global_audio);
+  if(!std::isfinite(audio_seconds) || audio_seconds <= 0.0){
+    return 0; // Invalid audio clock
+  }
+
+  // Use last displayed position for comparison, or current frame position if no frame displayed yet
+  double video_seconds = marsh->last_displayed_video_seconds >= 0.0
+                         ? marsh->last_displayed_video_seconds
+                         : current_video_seconds;
+  double diff_seconds = video_seconds - audio_seconds;
+
+  double threshold_seconds = static_cast<double>(expected_frame_ns) * kNcplayerAvSyncDropThreshold / 1e9;
+
+  // Drop frame if video is behind audio by threshold or more
+  if(diff_seconds <= -threshold_seconds){
+    // Update counters
+    marsh->dropped_frames++;
+    // Update framecount for logging
+    int64_t idx = ncvisual_frame_index(ncv);
+    if(idx >= 0){
+      marsh->framecount = idx;
+    }else{
+      ++marsh->framecount;
+    }
+    // Even when dropping, advance the tracked video position to the current frame
+    marsh->last_displayed_video_seconds = current_video_seconds;
+
+    // Log the drop
+    double diff_ms = diff_seconds * 1e3;
+    double threshold_ms = threshold_seconds * 1e3;
+    const std::string video_stamp = format_hms(video_seconds);
+    const std::string audio_stamp = format_hms(audio_seconds);
+    int framecount = marsh->framecount >= 0 ? marsh->framecount : 0;
+    logwarn("[frame-drop] video frame %06d: video behind audio by %.2fms, dropped (threshold %.2fms, video@%s, audio@%s)",
+            framecount, -diff_ms, threshold_ms,
+            video_stamp.c_str(), audio_stamp.c_str());
+    return 1; // Drop this frame
+  }
+
+  return 0; // Don't drop
+}
+}
+
 // frame count is in the curry. original time is kept in n's userptr.
 auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
               const struct timespec* abstime, void* vmarshal) -> int {
+  // vmarshal is the original curry (already extracted from wrapper by ffmpeg.c)
   struct marshal* marsh = static_cast<struct marshal*>(vmarshal);
   NotCurses &nc = NotCurses::get_instance();
   auto* runtime = get_plane_runtime(vopts->n);
@@ -1125,8 +1198,13 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .last_displayed_video_seconds = -1.0,
         .consecutive_video_ahead_count = 0,
       };
+      // Set up wrapper structure to pass drop check callback and original curry
+      struct ncplayer_stream_curry stream_curry = {
+        .drop_check = ncplayer_should_drop_frame_impl,
+        .original_curry = &marsh,
+      };
       logdebug("[stream] starting ncvisual_stream iteration with %ux%u plane", vopts.n ? ncplane_dim_x(vopts.n) : 0, vopts.n ? ncplane_dim_y(vopts.n) : 0);
-      r = ncv->stream(&vopts, timescale, perframe, &marsh);
+      r = ncv->stream(&vopts, timescale, perframe, &stream_curry);
       logdebug("[stream] ncvisual_stream returned %d", r);
       pending_request = marsh.request;
       if(pending_request == PlaybackRequest::Seek){
