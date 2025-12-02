@@ -7,6 +7,7 @@
 #include <clocale>
 #include <sstream>
 #include <string>
+#include <limits>
 #include <getopt.h>
 #include <libgen.h>
 #include <unistd.h>
@@ -1135,6 +1136,18 @@ static void audio_thread_func(audio_thread_data* data) {
   int consecutive_eagain = 0;
   auto last_log = std::chrono::steady_clock::now();
   int frames_since_log = 0;
+
+  // Track audio frame duration statistics
+  int audio_sample_rate = ffmpeg_get_audio_sample_rate(ncv);
+  if(audio_sample_rate <= 0){
+    audio_sample_rate = 44100; // Default fallback
+  }
+  double shortest_audio_duration = std::numeric_limits<double>::max();
+  double longest_audio_duration = 0.0;
+  double total_audio_duration = 0.0;
+  int audio_frame_count_for_stats = 0;
+  auto last_audio_stats_log = std::chrono::steady_clock::now();
+
   while(*running){
     bool audio_enabled = ffmpeg_is_audio_enabled(ncv);
     if(!audio_enabled){
@@ -1161,6 +1174,35 @@ static void audio_thread_func(audio_thread_data* data) {
     // until we've finished processing
     int samples = ffmpeg_get_decoded_audio_frame(ncv);
     if(samples > 0){
+      // Calculate audio frame duration: nb_samples / sample_rate
+      double frame_duration = static_cast<double>(samples) / audio_sample_rate;
+
+      // Track duration statistics
+      if(frame_duration < shortest_audio_duration){
+        shortest_audio_duration = frame_duration;
+      }
+      if(frame_duration > longest_audio_duration){
+        longest_audio_duration = frame_duration;
+      }
+      total_audio_duration += frame_duration;
+      audio_frame_count_for_stats++;
+
+      // Log statistics periodically (every 5 seconds)
+      auto now_stats = std::chrono::steady_clock::now();
+      auto elapsed_stats = std::chrono::duration_cast<std::chrono::milliseconds>(now_stats - last_audio_stats_log).count();
+      if(elapsed_stats >= 5000 && audio_frame_count_for_stats > 0){
+        double avg_duration = total_audio_duration / audio_frame_count_for_stats;
+        logdebug("[audio] frame duration stats: shortest=%.3fms, average=%.3fms, longest=%.3fms "
+                 "(from %d frames, sample_rate=%dHz)",
+                 shortest_audio_duration * 1000.0, avg_duration * 1000.0, longest_audio_duration * 1000.0,
+                 audio_frame_count_for_stats, audio_sample_rate);
+        // Reset stats for next period
+        shortest_audio_duration = std::numeric_limits<double>::max();
+        longest_audio_duration = 0.0;
+        total_audio_duration = 0.0;
+        audio_frame_count_for_stats = 0;
+        last_audio_stats_log = now_stats;
+      }
       do{
         consecutive_eagain = 0;
         uint8_t* out_data = nullptr;
