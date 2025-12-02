@@ -405,9 +405,25 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   if(marsh->blitter == NCBLIT_DEFAULT){
     marsh->blitter = ncvisual_media_defblitter(nc, vopts->scaling);
   }
-  const int current_volume = marsh->volume_percent ? marsh->volume_percent->load(std::memory_order_relaxed) : 100;
-  if(!marsh->quiet){
-    // FIXME put this on its own plane if we're going to be erase()ing it
+  // Helper function to update the status line (frame count, FPS, volume overlay, time)
+  auto update_status_line = [&](){
+    if(marsh->quiet){
+      return;
+    }
+    // Calculate display time (using different variable names to avoid shadowing)
+    int64_t status_display_ns;
+    double status_media_seconds = ffmpeg_get_video_position_seconds(ncv);
+    if(status_media_seconds >= 0.0){
+      status_display_ns = (int64_t)(status_media_seconds * (double)NANOSECS_IN_SEC);
+    }else{
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      status_display_ns = timespec_to_ns(&now) - timespec_to_ns(&runtime->start);
+    }
+    if(status_display_ns < 0){
+      status_display_ns = 0;
+    }
+    // Erase and update frame count/FPS/blitter display
     stdn->erase();
     if(marsh->show_fps){
       stdn->printf(0, NCAlign::Left, "frame %06d FPS %.2f drops %.1f%% (%s)",
@@ -417,6 +433,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       stdn->printf(0, NCAlign::Left, "frame %06d (%s)", marsh->framecount,
                    notcurses_str_blitter(vopts->blitter));
     }
+    // Update volume overlay if needed
     bool show_volume_overlay = false;
     if(marsh->volume_percent && marsh->volume_overlay_until.time_since_epoch().count() > 0){
       auto now_overlay = std::chrono::steady_clock::now();
@@ -426,9 +443,21 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       unsigned rows, cols;
       ncplane_dim_yx(*stdn, &rows, &cols);
       int center_row = rows > 0 ? static_cast<int>(rows / 2) : 0;
+      const int current_volume = marsh->volume_percent ? marsh->volume_percent->load(std::memory_order_relaxed) : 100;
       stdn->printf(center_row, NCAlign::Center, "vol %3d%%", current_volume);
     }
-  }
+    // Update time display
+    int64_t remaining = status_display_ns;
+    const int64_t h = remaining / (60 * 60 * NANOSECS_IN_SEC);
+    remaining -= h * (60 * 60 * NANOSECS_IN_SEC);
+    const int64_t m = remaining / (60 * NANOSECS_IN_SEC);
+    remaining -= m * (60 * NANOSECS_IN_SEC);
+    const int64_t s = remaining / NANOSECS_IN_SEC;
+    remaining -= s * NANOSECS_IN_SEC;
+    stdn->printf(0, NCAlign::Right, "%02" PRId64 ":%02" PRId64 ":%02" PRId64 ".%04" PRId64,
+                 h, m, s, remaining / 1000000);
+  };
+  update_status_line();
 
   const uint64_t target_ns = timespec_to_ns(abstime);
   const uint64_t prev_ns = marsh->last_abstime_ns;
@@ -748,7 +777,24 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         // Keep pause state after seek/restart
         return 2; // seek/restart
       }else if(key_result == 3){
-        // Needs re-render after visual change
+        // Needs re-render after visual change (blitter, volume, fps toggle, etc.)
+        // Re-render the current frame with the new settings
+        if(vopts->n){
+          // Erase the current plane to clear the old rendering
+          ncplane_erase(vopts->n);
+          // Re-render the current frame with the new blitter
+          // Cast NotCurses& to notcurses* using the conversion operator
+          if(ncvisual_blit(static_cast<notcurses*>(nc), ncv, vopts) == nullptr){
+            destroy_subtitle_plane();
+            return -1;
+          }
+          // Recreate subtitle plane if needed
+          destroy_subtitle_plane();
+          subp = recreate_subtitle_plane();
+          // Update status line with new blitter info
+          update_status_line();
+        }
+        // Render the updated display
         if(!nc.render()){
           destroy_subtitle_plane();
           return -1;
@@ -804,17 +850,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     }
     return 0; // unpaused successfully
   };
-  int64_t remaining = display_ns;
-  const int64_t h = remaining / (60 * 60 * NANOSECS_IN_SEC);
-  remaining -= h * (60 * 60 * NANOSECS_IN_SEC);
-  const int64_t m = remaining / (60 * NANOSECS_IN_SEC);
-  remaining -= m * (60 * NANOSECS_IN_SEC);
-  const int64_t s = remaining / NANOSECS_IN_SEC;
-  remaining -= s * NANOSECS_IN_SEC;
-  if(!marsh->quiet){
-    stdn->printf(0, NCAlign::Right, "%02" PRId64 ":%02" PRId64 ":%02" PRId64 ".%04" PRId64,
-                 h, m, s, remaining / 1000000);
-  }
+  // Time display is now handled by update_status_line() above
   if(marsh->resize_restart_pending){
     destroy_subtitle_plane();
     return 2;
