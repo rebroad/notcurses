@@ -225,8 +225,12 @@ static int ncplayer_should_drop_frame_impl(struct ncvisual* ncv, void* curry, ui
   double diff_seconds = video_seconds - audio_seconds;
 
   double threshold_seconds = static_cast<double>(expected_frame_ns) * kNcplayerAvSyncDropThreshold / 1e9;
+  // kNcplayerAvSyncDropThreshold = 1.5, so threshold is 1.5 frames worth of time
+  // This means we drop frames when video is behind audio by 1.5 frames or more
 
   // Drop frame if video is behind audio by threshold or more
+  // This is the ONLY place where frames are actually dropped - the ">threshold" logs
+  // in perframe() are just AV-sync state tracking, not frame drop decisions
   if(diff_seconds <= -threshold_seconds){
     // Update counters
     marsh->dropped_frames++;
@@ -328,58 +332,58 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
           marsh->current_fps = marsh->framecount / session_time;
         }
       }
+    }
 
-      // Check if FPS is below or above target
-      const uint64_t expected_frame_ns_snapshot = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
-      if(expected_frame_ns_snapshot > 0){
-        const double expected_fps_snapshot = static_cast<double>(NANOSECS_IN_SEC) / expected_frame_ns_snapshot;
-        const double fps_floor = expected_fps_snapshot * kNcplayerFpsFloorRatio;
-        const double fps_ceiling = expected_fps_snapshot * 1.10; // 110% of expected
-        const bool fps_is_low = marsh->current_fps > 0.0 && marsh->current_fps < fps_floor;
-        const bool fps_is_high = marsh->current_fps > fps_ceiling;
+    // Check if FPS is below or above target (check regardless of whether pointers are set)
+    const uint64_t expected_frame_ns_snapshot = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
+    if(expected_frame_ns_snapshot > 0){
+      const double expected_fps_snapshot = static_cast<double>(NANOSECS_IN_SEC) / expected_frame_ns_snapshot;
+      const double fps_floor = expected_fps_snapshot * kNcplayerFpsFloorRatio;
+      const double fps_ceiling = expected_fps_snapshot * 1.10; // 110% of expected
+      const bool fps_is_low = marsh->current_fps > 0.0 && marsh->current_fps < fps_floor;
+      const bool fps_is_high = marsh->current_fps > fps_ceiling;
 
-        // DRY: Helper for play time tracking
-        auto get_total_play_time_for_log = [&]() -> double {
-          double t = 0.0;
-          if(marsh->cumulative_play_time_seconds && marsh->play_start_time && marsh->play_time_tracking_active){
-            if(!marsh->is_paused && *marsh->play_time_tracking_active){
-              auto now = std::chrono::steady_clock::now();
-              auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *marsh->play_start_time).count();
-              double current_session_play_time = elapsed / 1000.0;
-              t = *marsh->cumulative_play_time_seconds + current_session_play_time;
-            }else{
-              t = *marsh->cumulative_play_time_seconds;
-            }
+      // DRY: Helper for play time tracking
+      auto get_total_play_time_for_log = [&]() -> double {
+        double t = 0.0;
+        if(marsh->cumulative_play_time_seconds && marsh->play_start_time && marsh->play_time_tracking_active){
+          if(!marsh->is_paused && *marsh->play_time_tracking_active){
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *marsh->play_start_time).count();
+            double current_session_play_time = elapsed / 1000.0;
+            t = *marsh->cumulative_play_time_seconds + current_session_play_time;
+          }else{
+            t = *marsh->cumulative_play_time_seconds;
           }
-          return t;
-        };
-        double total_play_time_for_log = get_total_play_time_for_log();
-
-        // FPS off-target transition logic
-        if(fps_is_low || fps_is_high){
-          if(!marsh->fps_off_target){
-            if(fps_is_low){
-              logwarn("[fps] %.2f FPS below %.0f%% of expected %.2f FPS (frame %06d, drops %.1f%%, "
-                      "calculated from %d frames / %.3fs play time)",
-                      marsh->current_fps, kNcplayerFpsFloorRatio * 100.0, expected_fps_snapshot,
-                      marsh->framecount, marsh->current_drop_pct,
-                      marsh->framecount, total_play_time_for_log);
-            }else{
-              logwarn("[fps] %.2f FPS above 110%% of expected %.2f FPS (frame %06d, drops %.1f%%, "
-                      "calculated from %d frames / %.3fs play time)",
-                      marsh->current_fps, expected_fps_snapshot,
-                      marsh->framecount, marsh->current_drop_pct,
-                      marsh->framecount, total_play_time_for_log);
-            }
-            marsh->fps_off_target = true;
-          }
-        }else if(marsh->fps_off_target){
-          loginfo("[fps] returned to normal %.2f FPS (expected %.2f FPS, "
-                  "calculated from %d frames / %.3fs play time)",
-                  marsh->current_fps, expected_fps_snapshot,
-                  marsh->framecount, total_play_time_for_log);
-          marsh->fps_off_target = false;
         }
+        return t;
+      };
+      double total_play_time_for_log = get_total_play_time_for_log();
+
+      // FPS off-target transition logic
+      if(fps_is_low || fps_is_high){
+        if(!marsh->fps_off_target){
+          if(fps_is_low){
+            logwarn("[fps] %.2f FPS below %.0f%% of expected %.2f FPS (frame %06d, drops %.1f%%, "
+                    "calculated from %d frames / %.3fs play time)",
+                    marsh->current_fps, kNcplayerFpsFloorRatio * 100.0, expected_fps_snapshot,
+                    marsh->framecount, marsh->current_drop_pct,
+                    marsh->framecount, total_play_time_for_log);
+          }else{
+            logwarn("[fps] %.2f FPS above 110%% of expected %.2f FPS (frame %06d, drops %.1f%%, "
+                    "calculated from %d frames / %.3fs play time)",
+                    marsh->current_fps, expected_fps_snapshot,
+                    marsh->framecount, marsh->current_drop_pct,
+                    marsh->framecount, total_play_time_for_log);
+          }
+          marsh->fps_off_target = true;
+        }
+      }else if(marsh->fps_off_target){
+        loginfo("[fps] returned to normal %.2f FPS (expected %.2f FPS, "
+                "calculated from %d frames / %.3fs play time)",
+                marsh->current_fps, expected_fps_snapshot,
+                marsh->framecount, total_play_time_for_log);
+        marsh->fps_off_target = false;
       }
     }
   }
