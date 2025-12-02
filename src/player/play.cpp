@@ -165,6 +165,7 @@ struct marshal {
   bool resize_restart_pending;
   std::atomic<int>* volume_percent;
   std::chrono::steady_clock::time_point volume_overlay_until;
+  int skip_frame_drop_count;  // frames to skip dropping after unpause to avoid catchup frenzy
 };
 
 static constexpr double kNcplayerSeekSeconds = 5.0;
@@ -323,11 +324,11 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         if(marsh->av_sync_state != new_state){
           double diff_ms = diff_seconds * 1e3;
           double threshold_ms = threshold_seconds * 1e3;
-          const char* relation = diff_seconds > 0.0 ? "ahead of" : "behind";
+          const char* issue = diff_seconds > 0.0 ? "audio behind video" : "video behind audio";
           const std::string video_stamp = format_hms(video_seconds);
           const std::string audio_stamp = format_hms(audio_seconds);
-          logwarn("[av-sync] video %.2fms %s audio (threshold %.2fms, frame %06d, video=%s, audio=%s)",
-                  std::fabs(diff_ms), relation, threshold_ms, marsh->framecount,
+          logwarn("[av-sync] %s by %.2fms (threshold %.2fms, frame %06d, video@%s, audio@%s)",
+                  issue, std::fabs(diff_ms), threshold_ms, marsh->framecount,
                   video_stamp.c_str(), audio_stamp.c_str());
           marsh->av_sync_state = new_state;
         }
@@ -335,7 +336,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         double diff_ms = diff_seconds * 1e3;
         const std::string video_stamp = format_hms(video_seconds);
         const std::string audio_stamp = format_hms(audio_seconds);
-        loginfo("[av-sync] recovered (delta %.2fms, frame %06d, video=%s, audio=%s)",
+        loginfo("[av-sync] in sync (drift %.2fms, frame %06d, video@%s, audio@%s)",
                 diff_ms, marsh->framecount, video_stamp.c_str(), audio_stamp.c_str());
         marsh->av_sync_state = 0;
       }
@@ -347,12 +348,15 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   uint64_t now_ns = timespec_to_ns(&nowts);
   int64_t lag_ns = (int64_t)now_ns - (int64_t)target_ns;
   const uint64_t drop_threshold_ns = expected_frame_ns * 3 / 2; // drop once 1.5 frames behind
-  if(lag_ns > (int64_t)drop_threshold_ns){
+  // Skip frame dropping if we just unpaused (to avoid catchup frenzy)
+  if(marsh->skip_frame_drop_count > 0){
+    marsh->skip_frame_drop_count--;
+  }else if(lag_ns > (int64_t)drop_threshold_ns){
     const double lag_ms = static_cast<double>(lag_ns) / 1e6;
     const double threshold_ms = static_cast<double>(drop_threshold_ns) / 1e6;
-    const double expected_ms = static_cast<double>(expected_frame_ns) / 1e6;
-    logwarn("[frame-drop] frame %06d lagged %.2fms > %.2fms threshold (expected frame %.2fms)",
-            marsh->framecount, lag_ms, threshold_ms, expected_ms);
+    const double interval_ms = static_cast<double>(expected_frame_ns) / 1e6;
+    logwarn("[frame-drop] video frame %06d: render %.2fms behind target time, dropped (threshold %.2fms, frame interval %.2fms)",
+            marsh->framecount, lag_ms, threshold_ms, interval_ms);
     marsh->dropped_frames++;
     return 0;
   }
@@ -478,12 +482,48 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       continue;
     }
     if(keyp == ' '){
+      // Pause audio while video is paused to maintain A/V sync
+      bool audio_enabled_before_pause = ffmpeg_is_audio_enabled(ncv);
+      double video_pos_at_pause = ffmpeg_get_video_position_seconds(ncv);
+      audio_output* ao_pause = audio_output_get_global();
+      double audio_pos_at_pause = ao_pause ? audio_output_get_clock(ao_pause) : -1.0;
+      loginfo("[pause] PAUSED at frame %06d, video=%.4fs, audio=%.4fs, audio_enabled=%d",
+              marsh->framecount, video_pos_at_pause, audio_pos_at_pause,
+              audio_enabled_before_pause ? 1 : 0);
+      if(audio_enabled_before_pause){
+        ffmpeg_set_audio_enabled(ncv, false);
+        logdebug("[pause] disabled audio for pause");
+      }
       do{
         if((keyp = nc.get(true, &ni)) == (uint32_t)-1){
           destroy_subtitle_plane();
           return -1;
         }
       }while(ni.id != 'q' && (ni.evtype == EvType::Release || ni.id != ' '));
+      // Resume audio when video unpauses
+      double video_pos_at_unpause = ffmpeg_get_video_position_seconds(ncv);
+      audio_output* ao_unpause = audio_output_get_global();
+      double audio_pos_at_unpause = ao_unpause ? audio_output_get_clock(ao_unpause) : -1.0;
+      loginfo("[pause] UNPAUSED at frame %06d, video=%.4fs, audio=%.4fs (was video=%.4fs, audio=%.4fs)",
+              marsh->framecount, video_pos_at_unpause, audio_pos_at_unpause,
+              video_pos_at_pause, audio_pos_at_pause);
+      if(audio_enabled_before_pause){
+        // Set audio clock to match video position for sync
+        // The flush during disable reset audio_clock to 0, so restore it
+        if(ao_unpause && std::isfinite(video_pos_at_pause) && video_pos_at_pause >= 0.0){
+          // Use set_pts to restore the audio clock to match video position
+          // time_base of 1.0 means pts is directly in seconds
+          audio_output_set_pts(ao_unpause, static_cast<uint64_t>(video_pos_at_pause * 1e9), 1e-9);
+          logdebug("[pause] restored audio clock to %.4fs", video_pos_at_pause);
+        }
+        ffmpeg_set_audio_enabled(ncv, true);
+        logdebug("[pause] re-enabled audio after unpause");
+      }
+      // Skip frame-drop check for several frames after unpause to avoid catchup frenzy
+      // Also reset timing baseline so subsequent frames don't appear "late"
+      marsh->skip_frame_drop_count = 5;  // skip dropping for ~5 frames to stabilize
+      marsh->last_abstime_ns = 0;
+      logdebug("[pause] set skip_frame_drop_count=5, reset last_abstime_ns");
     }
     // if we just hit a non-space character to unpause, ignore it
     const bool shift_pressed = ncinput_shift_p(&ni);
@@ -1007,8 +1047,11 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         if(ao){
           const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
           const int iter = stream_iteration - 1;
-          if(std::isfinite(audio_pos)){
-            logdebug("[audio] starting audio thread (iteration %d, media %.3fs)", iter, audio_pos);
+          // Initialize audio clock to current media position (not 0)
+          // so A/V sync tracking reflects actual media time
+          if(std::isfinite(audio_pos) && audio_pos >= 0.0){
+            audio_output_set_pts(ao, static_cast<uint64_t>(audio_pos * 1e9), 1e-9);
+            logdebug("[audio] starting audio thread (iteration %d, media %.3fs, clock initialized)", iter, audio_pos);
           }else{
             logdebug("[audio] starting audio thread (iteration %d, media unknown)", iter);
           }
@@ -1039,6 +1082,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .resize_restart_pending = false,
         .volume_percent = &volume_percent,
         .volume_overlay_until = std::chrono::steady_clock::time_point::min(),
+        .skip_frame_drop_count = 0,
       };
       logdebug("[stream] starting ncvisual_stream iteration with %ux%u plane", vopts.n ? ncplane_dim_x(vopts.n) : 0, vopts.n ? ncplane_dim_y(vopts.n) : 0);
       r = ncv->stream(&vopts, timescale, perframe, &marsh);
