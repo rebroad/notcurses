@@ -165,8 +165,7 @@ struct marshal {
   bool resize_restart_pending;
   std::atomic<int>* volume_percent;
   std::chrono::steady_clock::time_point volume_overlay_until;
-  uint64_t pause_start_ns;        // wall clock when pause started
-  uint64_t accumulated_pause_ns;  // total pause time to subtract from lag calculations
+  uint64_t timing_offset_ns;  // offset to apply to wall clock for lag calculations (set on unpause)
 };
 
 static constexpr double kNcplayerSeekSeconds = 5.0;
@@ -347,8 +346,8 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   struct timespec nowts;
   clock_gettime(CLOCK_MONOTONIC, &nowts);
   uint64_t now_ns = timespec_to_ns(&nowts);
-  // Subtract accumulated pause time from lag calculation so pauses don't cause frame drops
-  int64_t lag_ns = (int64_t)now_ns - (int64_t)target_ns - (int64_t)marsh->accumulated_pause_ns;
+  // Subtract timing offset from lag calculation (offset is set on unpause to account for pause duration)
+  int64_t lag_ns = (int64_t)now_ns - (int64_t)target_ns - (int64_t)marsh->timing_offset_ns;
   const uint64_t drop_threshold_ns = expected_frame_ns * 3 / 2; // drop once 1.5 frames behind
   if(lag_ns > (int64_t)drop_threshold_ns){
     const double lag_ms = static_cast<double>(lag_ns) / 1e6;
@@ -486,10 +485,6 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       double video_pos_at_pause = ffmpeg_get_video_position_seconds(ncv);
       audio_output* ao_pause = audio_output_get_global();
       double audio_pos_at_pause = ao_pause ? audio_output_get_clock(ao_pause) : -1.0;
-      // Record when pause started for timing adjustment
-      struct timespec pause_start_ts;
-      clock_gettime(CLOCK_MONOTONIC, &pause_start_ts);
-      marsh->pause_start_ns = timespec_to_ns(&pause_start_ts);
       loginfo("[pause] PAUSED at frame %06d, video=%.4fs, audio=%.4fs, audio_enabled=%d",
               marsh->framecount, video_pos_at_pause, audio_pos_at_pause,
               audio_enabled_before_pause ? 1 : 0);
@@ -503,20 +498,21 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
           return -1;
         }
       }while(ni.id != 'q' && (ni.evtype == EvType::Release || ni.id != ' '));
-      // Calculate pause duration and add to accumulated pause time
+      // Set timing offset so that next frame's lag is ~0
+      // offset = now - last_target, so: lag = now - target - offset ≈ 0
       struct timespec unpause_ts;
       clock_gettime(CLOCK_MONOTONIC, &unpause_ts);
-      uint64_t unpause_ns = timespec_to_ns(&unpause_ts);
-      uint64_t pause_duration_ns = unpause_ns - marsh->pause_start_ns;
-      marsh->accumulated_pause_ns += pause_duration_ns;
-      double pause_duration_ms = static_cast<double>(pause_duration_ns) / 1e6;
+      uint64_t unpause_now_ns = timespec_to_ns(&unpause_ts);
+      if(marsh->last_abstime_ns > 0){
+        marsh->timing_offset_ns = unpause_now_ns - marsh->last_abstime_ns;
+      }
       // Resume audio when video unpauses
       double video_pos_at_unpause = ffmpeg_get_video_position_seconds(ncv);
       audio_output* ao_unpause = audio_output_get_global();
       double audio_pos_at_unpause = ao_unpause ? audio_output_get_clock(ao_unpause) : -1.0;
-      loginfo("[pause] UNPAUSED at frame %06d, video=%.4fs, audio=%.4fs, paused for %.2fms (total pause %.2fms)",
+      loginfo("[pause] UNPAUSED at frame %06d, video=%.4fs, audio=%.4fs, timing_offset=%.2fms",
               marsh->framecount, video_pos_at_unpause, audio_pos_at_unpause,
-              pause_duration_ms, static_cast<double>(marsh->accumulated_pause_ns) / 1e6);
+              static_cast<double>(marsh->timing_offset_ns) / 1e6);
       if(audio_enabled_before_pause){
         // Set audio clock to match video position for sync
         // The flush during disable reset audio_clock to 0, so restore it
@@ -529,7 +525,6 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         ffmpeg_set_audio_enabled(ncv, true);
         logdebug("[pause] re-enabled audio after unpause");
       }
-      marsh->last_abstime_ns = 0;
     }
     // if we just hit a non-space character to unpause, ignore it
     const bool shift_pressed = ncinput_shift_p(&ni);
@@ -1088,8 +1083,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .resize_restart_pending = false,
         .volume_percent = &volume_percent,
         .volume_overlay_until = std::chrono::steady_clock::time_point::min(),
-        .pause_start_ns = 0,
-        .accumulated_pause_ns = 0,
+        .timing_offset_ns = 0,
       };
       logdebug("[stream] starting ncvisual_stream iteration with %ux%u plane", vopts.n ? ncplane_dim_x(vopts.n) : 0, vopts.n ? ncplane_dim_y(vopts.n) : 0);
       r = ncv->stream(&vopts, timescale, perframe, &marsh);
