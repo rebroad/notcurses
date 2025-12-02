@@ -500,12 +500,9 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     }
   }
 
-  // When video is ahead of audio, sleeping doesn't help - it makes it worse!
-  // The audio clock only advances when samples are consumed, so sleeping on video
-  // just delays video while audio still doesn't advance, increasing the gap.
-  // Instead, we should ensure audio is running and writing samples, and let
-  // the natural frame timing handle sync. If video is consistently ahead,
-  // the issue is that audio isn't advancing, not that video is too fast.
+  // When video is ahead of audio, we can try sleeping to let audio catch up
+  // BUT: Only if the gap is small (< 1000ms). Large gaps indicate a deeper issue
+  // (audio not advancing) that sleeping won't fix and might make worse.
   if(marsh->consecutive_video_ahead_count > 1 && global_audio != nullptr){
     double audio_seconds = audio_output_get_clock(global_audio);
     double video_pos = marsh->last_displayed_video_seconds >= 0.0
@@ -514,19 +511,33 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     double diff_seconds = video_pos - audio_seconds;
     bool audio_enabled = ffmpeg_is_audio_enabled(ncv);
 
-    // Add detailed debug logging to understand the issue
-    logwarn("[av-sync] video ahead by %.2fms (frame %06d) - DEBUG: video=%.4fs, audio=%.4fs, "
-            "audio_enabled=%d, last_displayed=%.4fs, current=%.4fs",
-            diff_seconds * 1e3, marsh->framecount, video_pos, audio_seconds,
-            audio_enabled ? 1 : 0, marsh->last_displayed_video_seconds, current_video_seconds);
-
     if(std::isfinite(audio_seconds) && audio_seconds > 0.0){
       if(diff_seconds > threshold_seconds){
-        // Log the issue but don't sleep - sleeping makes it worse
-        logwarn("[av-sync] audio clock may not be advancing. Check if audio thread is running and writing samples.");
+        const double max_sleep_threshold = 1.0; // 1000ms - only sleep if gap is smaller
+        if(diff_seconds < max_sleep_threshold){
+          // Small gap - try sleeping to let audio catch up
+          // Sleep for half the drift amount to gradually let audio catch up
+          uint64_t sleep_ns = (uint64_t)((diff_seconds * 0.5) * 1e9);
+          // Cap sleep at 1 frame interval to avoid huge delays
+          uint64_t max_sleep_ns = expected_frame_ns;
+          if(sleep_ns > max_sleep_ns){
+            sleep_ns = max_sleep_ns;
+          }
+          struct timespec sleep_ts;
+          ns_to_timespec(sleep_ns, &sleep_ts);
+          loginfo("[av-sync] sleeping %.2fms to let audio catch up (video ahead by %.2fms, frame %06d)",
+                  static_cast<double>(sleep_ns) / 1e6, diff_seconds * 1e3, marsh->framecount);
+          clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_ts, NULL);
+        }else{
+          // Large gap - don't sleep, log the issue instead
+          logwarn("[av-sync] video ahead by %.2fms (frame %06d, audio_enabled=%d) - gap too large for sleep fix. "
+                  "Audio clock may not be advancing. Check if audio thread is running and writing samples.",
+                  diff_seconds * 1e3, marsh->framecount, audio_enabled ? 1 : 0);
+        }
       }
     }else{
-      logwarn("[av-sync] audio clock is invalid (%.4fs) - audio output may not be initialized correctly", audio_seconds);
+      logwarn("[av-sync] audio clock is invalid (%.4fs, audio_enabled=%d) - audio output may not be initialized correctly",
+              audio_seconds, audio_enabled ? 1 : 0);
     }
   }
 
