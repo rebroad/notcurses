@@ -397,7 +397,12 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     }
   }
 
-  // Sleep to let audio catch up if video has been ahead for 2 consecutive frames
+  // When video is ahead of audio, sleeping doesn't help - it makes it worse!
+  // The audio clock only advances when samples are consumed, so sleeping on video
+  // just delays video while audio still doesn't advance, increasing the gap.
+  // Instead, we should ensure audio is running and writing samples, and let
+  // the natural frame timing handle sync. If video is consistently ahead,
+  // the issue is that audio isn't advancing, not that video is too fast.
   if(marsh->consecutive_video_ahead_count > 1 && global_audio != nullptr){
     double audio_seconds = audio_output_get_clock(global_audio);
     if(std::isfinite(audio_seconds) && audio_seconds > 0.0){
@@ -406,18 +411,10 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
                          : current_video_seconds;
       double diff_seconds = video_pos - audio_seconds;
       if(diff_seconds > threshold_seconds){
-        // Sleep for half the drift amount to gradually let audio catch up
-        uint64_t sleep_ns = (uint64_t)((diff_seconds * 0.5) * 1e9);
-        // Cap sleep at 1 frame interval to avoid huge delays
-        uint64_t max_sleep_ns = expected_frame_ns;
-        if(sleep_ns > max_sleep_ns){
-          sleep_ns = max_sleep_ns;
-        }
-        struct timespec sleep_ts;
-        ns_to_timespec(sleep_ns, &sleep_ts);
-        loginfo("[av-sync] sleeping %.2fms to let audio catch up (video ahead by %.2fms, frame %06d)",
-                static_cast<double>(sleep_ns) / 1e6, diff_seconds * 1e3, marsh->framecount);
-        clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_ts, NULL);
+        // Log the issue but don't sleep - sleeping makes it worse
+        logwarn("[av-sync] video ahead by %.2fms (frame %06d) - audio clock may not be advancing. "
+                "Check if audio thread is running and writing samples.",
+                diff_seconds * 1e3, marsh->framecount);
       }
     }
   }
@@ -662,6 +659,9 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       if(ao_unpause && std::isfinite(video_pos_at_unpause) && video_pos_at_unpause >= 0.0){
         audio_output_set_pts(ao_unpause, static_cast<uint64_t>(video_pos_at_unpause * 1e9), 1e-9);
         logdebug("[pause] restored audio clock to %.4fs (current video position)", video_pos_at_unpause);
+        // Ensure audio is started so the clock can advance
+        audio_output_start(ao_unpause);
+        logdebug("[pause] started audio output to allow clock to advance");
       }
       ffmpeg_set_audio_enabled(ncv, true);
       logdebug("[pause] re-enabled audio after unpause");
