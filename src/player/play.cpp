@@ -312,6 +312,10 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   }
   marsh->last_abstime_ns = target_ns;
   const uint64_t expected_frame_ns = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
+  // AV-sync tracking and frame dropping: drops frames when video is behind audio by more than
+  // 1.5 frames in media time. This is the only reason we drop frames - we don't care about
+  // render lag (wall clock vs scheduled time).
+  bool should_drop_frame = false;
   audio_output* global_audio = audio_output_get_global();
   if(global_audio != nullptr){
     double audio_seconds = audio_output_get_clock(global_audio);
@@ -319,6 +323,20 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       double video_seconds = static_cast<double>(display_ns) / 1e9;
       double diff_seconds = video_seconds - audio_seconds;
       double threshold_seconds = static_cast<double>(expected_frame_ns) * 1.5 / 1e9;
+
+      // Drop frame if video is behind audio by threshold or more
+      if(diff_seconds <= -threshold_seconds){
+        should_drop_frame = true;
+        double diff_ms = diff_seconds * 1e3;
+        double threshold_ms = threshold_seconds * 1e3;
+        const std::string video_stamp = format_hms(video_seconds);
+        const std::string audio_stamp = format_hms(audio_seconds);
+        logwarn("[frame-drop] video frame %06d: video behind audio by %.2fms, dropped (threshold %.2fms, video@%s, audio@%s)",
+                marsh->framecount, -diff_ms, threshold_ms,
+                video_stamp.c_str(), audio_stamp.c_str());
+      }
+
+      // Track AV-sync state for logging
       if(std::fabs(diff_seconds) > threshold_seconds){
         int new_state = diff_seconds > 0.0 ? 1 : -1;
         if(marsh->av_sync_state != new_state){
@@ -336,28 +354,24 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         double diff_ms = diff_seconds * 1e3;
         const std::string video_stamp = format_hms(video_seconds);
         const std::string audio_stamp = format_hms(audio_seconds);
-        loginfo("[av-sync] in sync (drift %.2fms, frame %06d, video@%s, audio@%s)",
+        loginfo("[av-sync] drift within threshold (drift %.2fms, frame %06d, video@%s, audio@%s)",
                 diff_ms, marsh->framecount, video_stamp.c_str(), audio_stamp.c_str());
         marsh->av_sync_state = 0;
       }
     }
   }
 
+  if(should_drop_frame){
+    marsh->dropped_frames++;
+    return 0;
+  }
+
+  // Sleep if we're ahead of schedule (based on wall clock vs scheduled frame time)
   struct timespec nowts;
   clock_gettime(CLOCK_MONOTONIC, &nowts);
   uint64_t now_ns = timespec_to_ns(&nowts);
   // Subtract timing offset from lag calculation (offset is set on unpause to account for pause duration)
   int64_t lag_ns = (int64_t)now_ns - (int64_t)target_ns - (int64_t)marsh->timing_offset_ns;
-  const uint64_t drop_threshold_ns = expected_frame_ns * 3 / 2; // drop once 1.5 frames behind
-  if(lag_ns > (int64_t)drop_threshold_ns){
-    const double lag_ms = static_cast<double>(lag_ns) / 1e6;
-    const double threshold_ms = static_cast<double>(drop_threshold_ns) / 1e6;
-    const double interval_ms = static_cast<double>(expected_frame_ns) / 1e6;
-    logwarn("[frame-drop] video frame %06d: render %.2fms behind target time, dropped (threshold %.2fms, frame interval %.2fms)",
-            marsh->framecount, lag_ms, threshold_ms, interval_ms);
-    marsh->dropped_frames++;
-    return 0;
-  }
   if(lag_ns < 0){
     struct timespec sleep_ts;
     ns_to_timespec((uint64_t)(-lag_ns), &sleep_ts);
