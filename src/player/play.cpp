@@ -48,6 +48,7 @@ bool ffmpeg_is_audio_enabled(ncvisual* ncv);
 double ffmpeg_get_video_position_seconds(const ncvisual* ncv);
 }
 
+
 static void usage(std::ostream& os, const char* name, int exitcode)
   __attribute__ ((noreturn));
 
@@ -176,6 +177,7 @@ static constexpr int kNcplayerVolumeOverlayMs = 1000;
 static constexpr int kNcplayerVolumeStep = 5;
 static constexpr uint64_t kNcplayerDefaultFrameNs = 41666667ull; // ~24fps
 static constexpr double kNcplayerFpsFloorRatio = 0.9;            // 90%
+static constexpr double kNcplayerAvSyncDropThreshold = 1.5;      // drop frames when video is behind audio by this many frames
 
 static std::string
 format_hms(double seconds){
@@ -209,6 +211,7 @@ format_hms(double seconds){
                 negative ? "-" : "", hours, minutes, whole_secs, frac_part);
   return std::string(buf);
 }
+
 // frame count is in the curry. original time is kept in n's userptr.
 auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
               const struct timespec* abstime, void* vmarshal) -> int {
@@ -218,6 +221,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   if(runtime == nullptr){
     return -1;
   }
+
   std::unique_ptr<Plane> stdn(nc.get_stdplane());
   static auto last_fps_sample = std::chrono::steady_clock::now();
   static int frames_since_sample = 0;
@@ -314,80 +318,50 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   }
   marsh->last_abstime_ns = target_ns;
   const uint64_t expected_frame_ns = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
-  // AV-sync tracking and frame dropping: drops frames when video is behind audio by 1.5 frames
-  // or more in media time. We compare using the last DISPLAYED frame position, not the current
-  // frame position, so that dropped frames don't affect the comparison.
-  double current_video_seconds = static_cast<double>(display_ns) / 1e9;
-  bool should_drop_frame = false;
+
+  double current_video_seconds = media_seconds >= 0.0 ? media_seconds : (static_cast<double>(display_ns) / 1e9);
   audio_output* global_audio = audio_output_get_global();
-  double threshold_seconds = static_cast<double>(expected_frame_ns) * 1.5 / 1e9;
+  double threshold_seconds = static_cast<double>(expected_frame_ns) * kNcplayerAvSyncDropThreshold / 1e9;
+
+  // Track AV-sync state for logging
+  // Use the position we'd use for display (last displayed or current if first frame)
   if(global_audio != nullptr){
     double audio_seconds = audio_output_get_clock(global_audio);
     if(std::isfinite(audio_seconds) && audio_seconds > 0.0){
-      // Use last displayed position for comparison, or current frame position if no frame displayed yet
-      double video_seconds = marsh->last_displayed_video_seconds >= 0.0
-                             ? marsh->last_displayed_video_seconds
-                             : current_video_seconds;
-      double diff_seconds = video_seconds - audio_seconds;
-
-      // Drop frame if video is behind audio by threshold or more
-      if(diff_seconds <= -threshold_seconds){
-        should_drop_frame = true;
-        double diff_ms = diff_seconds * 1e3;
-        double threshold_ms = threshold_seconds * 1e3;
-        const std::string video_stamp = format_hms(video_seconds);
-        const std::string audio_stamp = format_hms(audio_seconds);
-        logwarn("[frame-drop] video frame %06d: video behind audio by %.2fms, dropped (threshold %.2fms, video@%s, audio@%s)",
-                marsh->framecount, -diff_ms, threshold_ms,
-                video_stamp.c_str(), audio_stamp.c_str());
-      }
-
-      // Track AV-sync state for logging (only if we're not dropping this frame)
-      // Use the position we'd use for display (last displayed or current if first frame)
-      if(!should_drop_frame){
-        double video_pos_for_sync = marsh->last_displayed_video_seconds >= 0.0
-                                     ? marsh->last_displayed_video_seconds
-                                     : current_video_seconds;
-        double current_diff = video_pos_for_sync - audio_seconds;
-        if(std::fabs(current_diff) > threshold_seconds){
-          int new_state = current_diff > 0.0 ? 1 : -1;
-          if(marsh->av_sync_state != new_state){
-            double diff_ms = current_diff * 1e3;
-            double threshold_ms = threshold_seconds * 1e3;
-            const char* issue = current_diff > 0.0 ? "audio behind video" : "video behind audio";
-            const std::string video_stamp = format_hms(video_pos_for_sync);
-            const std::string audio_stamp = format_hms(audio_seconds);
-            logwarn("[av-sync] %s by %.2fms (threshold %.2fms, frame %06d, video@%s, audio@%s)",
-                    issue, std::fabs(diff_ms), threshold_ms, marsh->framecount,
-                    video_stamp.c_str(), audio_stamp.c_str());
-            marsh->av_sync_state = new_state;
-            marsh->consecutive_video_ahead_count = 0; // Reset counter on state change
-          }
-          // Track consecutive frames where video is ahead of audio by threshold
-          if(marsh->av_sync_state == 1 && current_diff > threshold_seconds){
-            marsh->consecutive_video_ahead_count++;
-          }else{
-            marsh->consecutive_video_ahead_count = 0;
-          }
-        }else if(marsh->av_sync_state != 0){
+      double video_pos_for_sync = marsh->last_displayed_video_seconds >= 0.0
+                                   ? marsh->last_displayed_video_seconds
+                                   : current_video_seconds;
+      double current_diff = video_pos_for_sync - audio_seconds;
+      if(std::fabs(current_diff) > threshold_seconds){
+        int new_state = current_diff > 0.0 ? 1 : -1;
+        if(marsh->av_sync_state != new_state){
           double diff_ms = current_diff * 1e3;
+          double threshold_ms = threshold_seconds * 1e3;
+          const char* issue = current_diff > 0.0 ? "audio behind video" : "video behind audio";
           const std::string video_stamp = format_hms(video_pos_for_sync);
           const std::string audio_stamp = format_hms(audio_seconds);
-          loginfo("[av-sync] drift within threshold (drift %.2fms, frame %06d, video@%s, audio@%s)",
-                  diff_ms, marsh->framecount, video_stamp.c_str(), audio_stamp.c_str());
-          marsh->av_sync_state = 0;
-          marsh->consecutive_video_ahead_count = 0; // Reset counter when in sync
+          logwarn("[av-sync] %s by %.2fms (threshold %.2fms, frame %06d, video@%s, audio@%s)",
+                  issue, std::fabs(diff_ms), threshold_ms, marsh->framecount,
+                  video_stamp.c_str(), audio_stamp.c_str());
+          marsh->av_sync_state = new_state;
+          marsh->consecutive_video_ahead_count = 0; // Reset counter on state change
         }
+        // Track consecutive frames where video is ahead of audio by threshold
+        if(marsh->av_sync_state == 1 && current_diff > threshold_seconds){
+          marsh->consecutive_video_ahead_count++;
+        }else{
+          marsh->consecutive_video_ahead_count = 0;
+        }
+      }else if(marsh->av_sync_state != 0){
+        double diff_ms = current_diff * 1e3;
+        const std::string video_stamp = format_hms(video_pos_for_sync);
+        const std::string audio_stamp = format_hms(audio_seconds);
+        loginfo("[av-sync] drift within threshold (drift %.2fms, frame %06d, video@%s, audio@%s)",
+                diff_ms, marsh->framecount, video_stamp.c_str(), audio_stamp.c_str());
+        marsh->av_sync_state = 0;
+        marsh->consecutive_video_ahead_count = 0; // Reset counter when in sync
       }
     }
-  }
-
-  if(should_drop_frame){
-    marsh->dropped_frames++;
-    // Even when dropping, advance the tracked video position to the current frame
-    // so we don't get stuck comparing against an old position
-    marsh->last_displayed_video_seconds = current_video_seconds;
-    return 0;
   }
 
   // Sleep to let audio catch up if video has been ahead for 2 consecutive frames

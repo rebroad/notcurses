@@ -1352,6 +1352,7 @@ ffmpeg_stream(notcurses* nc, ncvisual* ncv, float timescale,
     if(isnan(tbase)){
       tbase = 0;
     }
+
     if(activevopts.n){
       ncplane_erase(activevopts.n); // new frame could be partially transparent
     }
