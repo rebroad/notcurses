@@ -1395,8 +1395,16 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         }
         logdebug("[seek] from %.3fs to %.3fs (delta=%.3fs, absolute=%d)", from_pos, to_pos, delta, was_absolute ? 1 : 0);
         if(ncvisual_seek(*ncv, delta) == 0){
+          // Note: actual position may differ from target because av_seek_frame seeks to nearest keyframe
+          // The actual position will be accurate after the first frame is decoded
           double actual_pos = ffmpeg_get_video_position_seconds(*ncv);
-          logdebug("[seek] success, actual position %.3fs", actual_pos);
+          double position_diff = actual_pos - to_pos;
+          if(std::fabs(position_diff) > 0.1){ // More than 100ms difference
+            logdebug("[seek] success, actual position %.3fs (target was %.3fs, diff=%.3fs, keyframe seek)", 
+                     actual_pos, to_pos, position_diff);
+          }else{
+            logdebug("[seek] success, actual position %.3fs", actual_pos);
+          }
           pending_request = PlaybackRequest::None;
           restart_stream = true;
           pending_seek_value = 0.0;
