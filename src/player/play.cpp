@@ -561,9 +561,28 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     loginfo("[pause] PAUSED at frame %06d, video=%.4fs, audio=%.4fs, audio_enabled=%d",
             marsh->framecount, video_pos_at_pause, audio_pos_at_pause,
             audio_enabled_before_pause ? 1 : 0);
+    // Only disable audio if it's currently enabled
+    // If we're re-entering pause after a seek, audio might already be disabled
+    // and we don't want to flush it again (which would reset the clock)
     if(audio_enabled_before_pause){
+      // Save the current audio clock position before disabling
+      // The audio thread will flush and reset it to 0, but we'll restore it on unpause
+      // Use the current video position as the audio position (they should be in sync)
+      // This is especially important after a seek during pause
+      double saved_audio_pos = audio_pos_at_pause >= 0.0 ? audio_pos_at_pause : video_pos_at_pause;
       ffmpeg_set_audio_enabled(ncv, false);
-      logdebug("[pause] disabled audio for pause");
+      // Immediately restore the clock position after disabling (audio thread may have flushed it)
+      // This preserves the position even if the audio thread flushed
+      if(ao_pause && std::isfinite(saved_audio_pos) && saved_audio_pos >= 0.0){
+        audio_output_set_pts(ao_pause, static_cast<uint64_t>(saved_audio_pos * 1e9), 1e-9);
+        logdebug("[pause] disabled audio and preserved clock at %.4fs", saved_audio_pos);
+      }else{
+        logdebug("[pause] disabled audio for pause");
+      }
+    }else{
+      // Audio was already disabled (e.g., after a seek during pause)
+      // The audio clock should already be at the correct position from the seek
+      logdebug("[pause] audio already disabled, preserving clock position");
     }
 
     while(marsh->is_paused){
@@ -638,10 +657,11 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
             marsh->framecount, video_pos_at_unpause, audio_pos_at_unpause,
             static_cast<double>(marsh->timing_offset_ns) / 1e6);
     if(audio_enabled_before_pause){
-      // Set audio clock to match video position for sync
-      if(ao_unpause && std::isfinite(video_pos_at_pause) && video_pos_at_pause >= 0.0){
-        audio_output_set_pts(ao_unpause, static_cast<uint64_t>(video_pos_at_pause * 1e9), 1e-9);
-        logdebug("[pause] restored audio clock to %.4fs", video_pos_at_pause);
+      // Set audio clock to match CURRENT video position for sync
+      // Use video_pos_at_unpause (not video_pos_at_pause) in case user sought during pause
+      if(ao_unpause && std::isfinite(video_pos_at_unpause) && video_pos_at_unpause >= 0.0){
+        audio_output_set_pts(ao_unpause, static_cast<uint64_t>(video_pos_at_unpause * 1e9), 1e-9);
+        logdebug("[pause] restored audio clock to %.4fs (current video position)", video_pos_at_unpause);
       }
       ffmpeg_set_audio_enabled(ncv, true);
       logdebug("[pause] re-enabled audio after unpause");
@@ -1218,7 +1238,9 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         needs_plane_recreate = false;
       }
       /* capture needs_plane_recreate and apply before next stream */
-      if(ffmpeg_has_audio(*ncv) && audio_thread == nullptr){
+      // Don't start audio thread if we're paused - it will be started on unpause
+      // This prevents the audio thread from flushing and resetting the clock during pause
+      if(ffmpeg_has_audio(*ncv) && audio_thread == nullptr && !is_paused){
         int sample_rate = 44100;
         int channels = ffmpeg_get_audio_channels(*ncv);
         if(channels > 2){
@@ -1242,6 +1264,25 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
           audio_output_start(ao);
         }else{
           logerror("[audio] failed to init audio output");
+        }
+      }else if(ffmpeg_has_audio(*ncv) && audio_thread == nullptr && is_paused){
+        // We're paused, so initialize audio output but don't start the thread yet
+        // This allows us to set the clock position for when we unpause
+        int sample_rate = 44100;
+        int channels = ffmpeg_get_audio_channels(*ncv);
+        if(channels > 2){
+          channels = 2;
+        }
+        ao = audio_output_init(sample_rate, channels, AV_SAMPLE_FMT_S16);
+        if(ao){
+          const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
+          // Initialize audio clock to current media position for when we unpause
+          if(std::isfinite(audio_pos) && audio_pos >= 0.0){
+            audio_output_set_pts(ao, static_cast<uint64_t>(audio_pos * 1e9), 1e-9);
+            logdebug("[audio] initialized audio output (paused, media %.3fs, thread not started)", audio_pos);
+          }
+          // Don't start the thread or enable audio - we're paused
+          ffmpeg_set_audio_enabled(*ncv, false);
         }
       }
 
