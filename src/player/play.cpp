@@ -171,6 +171,7 @@ struct marshal {
   uint64_t timing_offset_ns;  // offset to apply to wall clock for lag calculations (set on unpause)
   double last_displayed_video_seconds; // video position of last actually displayed frame (for AV-sync)
   int consecutive_video_ahead_count; // count of consecutive frames where video is ahead of audio
+  bool is_paused; // current pause state
 };
 
 static constexpr double kNcplayerSeekSeconds = 5.0;
@@ -485,6 +486,168 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     marsh->volume_overlay_until = std::chrono::steady_clock::now() +
                                   std::chrono::milliseconds(kNcplayerVolumeOverlayMs);
   };
+  // Helper function to handle common key events
+  // Returns: -1 = not handled (fall through); 0 = handled, continue normally; 1 = error; 2 = seek/restart; 3 = needs re-render
+  auto handle_common_key = [&](uint32_t keyp, const ncinput& ni, bool during_pause) -> int {
+    const bool shift_pressed = ncinput_shift_p(&ni);
+
+    // Handle resize
+    if(keyp == NCKey::Resize){
+      if(marsh->resize_restart_pending){
+        logdebug("[resize] restart already pending, skipping resize%s", during_pause ? " during pause" : "");
+        return 0; // handled, continue
+      }
+      unsigned resize_dimx, resize_dimy;
+      if(!nc.refresh(&resize_dimy, &resize_dimx)){
+        destroy_subtitle_plane();
+        return 1; // error
+      }
+      logdebug("[resize] resize event captured%s (%ux%u)", during_pause ? " during pause" : "", resize_dimx, resize_dimy);
+      int restart = request_resize_restart(during_pause ? "resize during pause" : "key resize");
+      if(restart != 0){
+        return restart; // 2 = seek/restart
+      }
+      return during_pause ? 3 : 0; // needs re-render if during pause, else continue normally
+    }
+
+    // Handle seek (left/right arrows)
+    if(keyp == NCKey::Right){
+      marsh->request = PlaybackRequest::Seek;
+      marsh->seek_delta = shift_pressed ? kNcplayerSeekMinutes : kNcplayerSeekSeconds;
+      marsh->seek_absolute = false;
+      destroy_subtitle_plane();
+      return 2; // seek/restart
+    }else if(keyp == NCKey::Left){
+      marsh->request = PlaybackRequest::Seek;
+      marsh->seek_delta = shift_pressed ? -kNcplayerSeekMinutes : -kNcplayerSeekSeconds;
+      marsh->seek_absolute = false;
+      destroy_subtitle_plane();
+      return 2; // seek/restart
+    }
+
+    // Handle volume (up/down arrows)
+    if(keyp == NCKey::Up){
+      adjust_volume(kNcplayerVolumeStep);
+      return during_pause ? 3 : 0; // needs re-render if during pause, else continue normally
+    }else if(keyp == NCKey::Down){
+      adjust_volume(-kNcplayerVolumeStep);
+      return during_pause ? 3 : 0; // needs re-render if during pause, else continue normally
+    }
+
+    // Handle blitter changes (0-6)
+    if(keyp >= '0' && keyp <= '6' && !ncinput_alt_p(&ni) && !ncinput_ctrl_p(&ni)){
+      marsh->blitter = static_cast<ncblitter_e>(keyp - '0');
+      vopts->blitter = marsh->blitter;
+      return during_pause ? 3 : 0; // needs re-render if during pause, else continue normally
+    }
+
+    // Handle FPS toggle
+    if(keyp == 'f' || keyp == 'F'){
+      marsh->show_fps = !marsh->show_fps;
+      return during_pause ? 3 : 0; // needs re-render if during pause, else continue normally
+    }
+
+    return -1; // not handled by common keys
+  };
+
+  // Single pause loop - handles all pause-related input
+  // Returns: -1 = error; 1 = quit; 2 = seek/restart; 0 = unpaused
+  auto enter_pause_loop = [&]() -> int {
+    // Pause audio while video is paused to maintain A/V sync
+    bool audio_enabled_before_pause = ffmpeg_is_audio_enabled(ncv);
+    double video_pos_at_pause = ffmpeg_get_video_position_seconds(ncv);
+    audio_output* ao_pause = audio_output_get_global();
+    double audio_pos_at_pause = ao_pause ? audio_output_get_clock(ao_pause) : -1.0;
+    loginfo("[pause] PAUSED at frame %06d, video=%.4fs, audio=%.4fs, audio_enabled=%d",
+            marsh->framecount, video_pos_at_pause, audio_pos_at_pause,
+            audio_enabled_before_pause ? 1 : 0);
+    if(audio_enabled_before_pause){
+      ffmpeg_set_audio_enabled(ncv, false);
+      logdebug("[pause] disabled audio for pause");
+    }
+
+    while(marsh->is_paused){
+      // Check for async resize events (from resize callback)
+      if(pop_async_resize()){
+        int restart = request_resize_restart("async resize during pause");
+        if(restart != 0){
+          // Keep pause state after restart
+          return restart;
+        }
+        // Re-render after resize
+        if(!nc.render()){
+          destroy_subtitle_plane();
+          return -1;
+        }
+      }
+      uint32_t keyp;
+      ncinput ni;
+      if((keyp = nc.get(true, &ni)) == (uint32_t)-1){
+        destroy_subtitle_plane();
+        return -1;
+      }
+      // Ignore key release events
+      if(ni.evtype == EvType::Release){
+        continue;
+      }
+      // Handle quit
+      if(ni.id == 'q' || ni.id == 'Q'){
+        marsh->request = PlaybackRequest::Quit;
+        destroy_subtitle_plane();
+        return 1;
+      }
+      // Handle unpause (space toggles pause state)
+      if(ni.id == ' '){
+        marsh->is_paused = false;
+        break;
+      }
+      // Handle common keys (resize, seek, volume, blitter, fps)
+      int key_result = handle_common_key(ni.id, ni, true);
+      if(key_result == 1){
+        destroy_subtitle_plane();
+        return -1; // error
+      }else if(key_result == 2){
+        // Keep pause state after seek/restart
+        return 2; // seek/restart
+      }else if(key_result == 3){
+        // Needs re-render after visual change
+        if(!nc.render()){
+          destroy_subtitle_plane();
+          return -1;
+        }
+        continue;
+      }else if(key_result == 0){
+        // Key was handled, continue
+        continue;
+      }
+      // If key_result == -1, it wasn't a common key, ignore it
+    }
+
+    // Set timing offset so that next frame's lag is ~0
+    struct timespec unpause_ts;
+    clock_gettime(CLOCK_MONOTONIC, &unpause_ts);
+    uint64_t unpause_now_ns = timespec_to_ns(&unpause_ts);
+    if(marsh->last_abstime_ns > 0){
+      marsh->timing_offset_ns = unpause_now_ns - marsh->last_abstime_ns;
+    }
+    // Resume audio when video unpauses
+    double video_pos_at_unpause = ffmpeg_get_video_position_seconds(ncv);
+    audio_output* ao_unpause = audio_output_get_global();
+    double audio_pos_at_unpause = ao_unpause ? audio_output_get_clock(ao_unpause) : -1.0;
+    loginfo("[pause] UNPAUSED at frame %06d, video=%.4fs, audio=%.4fs, timing_offset=%.2fms",
+            marsh->framecount, video_pos_at_unpause, audio_pos_at_unpause,
+            static_cast<double>(marsh->timing_offset_ns) / 1e6);
+    if(audio_enabled_before_pause){
+      // Set audio clock to match video position for sync
+      if(ao_unpause && std::isfinite(video_pos_at_pause) && video_pos_at_pause >= 0.0){
+        audio_output_set_pts(ao_unpause, static_cast<uint64_t>(video_pos_at_pause * 1e9), 1e-9);
+        logdebug("[pause] restored audio clock to %.4fs", video_pos_at_pause);
+      }
+      ffmpeg_set_audio_enabled(ncv, true);
+      logdebug("[pause] re-enabled audio after unpause");
+    }
+    return 0; // unpaused successfully
+  };
   int64_t remaining = display_ns;
   const int64_t h = remaining / (60 * 60 * NANOSECS_IN_SEC);
   remaining -= h * (60 * 60 * NANOSECS_IN_SEC);
@@ -503,6 +666,13 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   if(!nc.render()){
     destroy_subtitle_plane();
     return -1;
+  }
+  // Check if we should be paused (after seek/resize during pause)
+  if(marsh->is_paused){
+    int pause_result = enter_pause_loop();
+    if(pause_result != 0){
+      return pause_result; // error, quit, or seek/restart
+    }
   }
   if(pop_async_resize()){
     int restart = request_resize_restart("plane resize callback");
@@ -549,101 +719,36 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       continue;
     }
     if(keyp == ' '){
-      // Pause audio while video is paused to maintain A/V sync
-      bool audio_enabled_before_pause = ffmpeg_is_audio_enabled(ncv);
-      double video_pos_at_pause = ffmpeg_get_video_position_seconds(ncv);
-      audio_output* ao_pause = audio_output_get_global();
-      double audio_pos_at_pause = ao_pause ? audio_output_get_clock(ao_pause) : -1.0;
-      loginfo("[pause] PAUSED at frame %06d, video=%.4fs, audio=%.4fs, audio_enabled=%d",
-              marsh->framecount, video_pos_at_pause, audio_pos_at_pause,
-              audio_enabled_before_pause ? 1 : 0);
-      if(audio_enabled_before_pause){
-        ffmpeg_set_audio_enabled(ncv, false);
-        logdebug("[pause] disabled audio for pause");
-      }
-      do{
-        if((keyp = nc.get(true, &ni)) == (uint32_t)-1){
-          destroy_subtitle_plane();
-          return -1;
+      // Toggle pause state
+      marsh->is_paused = !marsh->is_paused;
+      if(marsh->is_paused){
+        int pause_result = enter_pause_loop();
+        if(pause_result != 0){
+          return pause_result; // error, quit, or seek/restart
         }
-      }while(ni.id != 'q' && (ni.evtype == EvType::Release || ni.id != ' '));
-      // Set timing offset so that next frame's lag is ~0
-      // offset = now - last_target, so: lag = now - target - offset ≈ 0
-      struct timespec unpause_ts;
-      clock_gettime(CLOCK_MONOTONIC, &unpause_ts);
-      uint64_t unpause_now_ns = timespec_to_ns(&unpause_ts);
-      if(marsh->last_abstime_ns > 0){
-        marsh->timing_offset_ns = unpause_now_ns - marsh->last_abstime_ns;
-      }
-      // Resume audio when video unpauses
-      double video_pos_at_unpause = ffmpeg_get_video_position_seconds(ncv);
-      audio_output* ao_unpause = audio_output_get_global();
-      double audio_pos_at_unpause = ao_unpause ? audio_output_get_clock(ao_unpause) : -1.0;
-      loginfo("[pause] UNPAUSED at frame %06d, video=%.4fs, audio=%.4fs, timing_offset=%.2fms",
-              marsh->framecount, video_pos_at_unpause, audio_pos_at_unpause,
-              static_cast<double>(marsh->timing_offset_ns) / 1e6);
-      if(audio_enabled_before_pause){
-        // Set audio clock to match video position for sync
-        // The flush during disable reset audio_clock to 0, so restore it
-        if(ao_unpause && std::isfinite(video_pos_at_pause) && video_pos_at_pause >= 0.0){
-          // Use set_pts to restore the audio clock to match video position
-          // time_base of 1.0 means pts is directly in seconds
-          audio_output_set_pts(ao_unpause, static_cast<uint64_t>(video_pos_at_pause * 1e9), 1e-9);
-          logdebug("[pause] restored audio clock to %.4fs", video_pos_at_pause);
-        }
-        ffmpeg_set_audio_enabled(ncv, true);
-        logdebug("[pause] re-enabled audio after unpause");
-      }
-    }
-    // if we just hit a non-space character to unpause, ignore it
-    const bool shift_pressed = ncinput_shift_p(&ni);
-    if(keyp == NCKey::Resize){
-      if(marsh->resize_restart_pending){
-        logdebug("[resize] restart already pending, skipping key resize");
-        continue;
-      }
-      if(!nc.refresh(&dimy, &dimx)){
-        destroy_subtitle_plane();
-        return -1;
-      }
-      logdebug("[resize] resize event captured (%ux%u)", dimx, dimy);
-      int restart = request_resize_restart("key resize");
-      if(restart != 0){
-        return restart;
       }
       continue;
-    }else if(keyp == ' '){ // space for unpause
+    }
+    // if we just hit a non-space character to unpause, ignore it
+    // Handle common keys (resize, seek, volume, blitter, fps)
+    int key_result = handle_common_key(keyp, ni, false);
+    if(key_result == 1){
+      destroy_subtitle_plane();
+      return -1; // error
+    }else if(key_result == 2){
+      return 2; // seek/restart
+    }else if(key_result == 0){
+      // Key was handled, continue
+      continue;
+    }
+    // If key_result == -1, it wasn't a common key, check other keys
+    if(keyp == ' '){ // space for unpause
       continue;
     }else if(keyp == 'L' && ncinput_ctrl_p(&ni) && !ncinput_alt_p(&ni)){
       nc.refresh(nullptr, nullptr);
       continue;
-    }else if(keyp >= '0' && keyp <= '6' && !ncinput_alt_p(&ni) && !ncinput_ctrl_p(&ni)){
-      marsh->blitter = static_cast<ncblitter_e>(keyp - '0');
-      vopts->blitter = marsh->blitter;
-      continue;
     }else if(keyp >= '7' && keyp <= '9' && !ncinput_alt_p(&ni) && !ncinput_ctrl_p(&ni)){
       continue; // don't error out
-    }else if(keyp == 'f' || keyp == 'F'){
-      marsh->show_fps = !marsh->show_fps;
-      continue;
-    }else if(keyp == NCKey::Up){
-      adjust_volume(kNcplayerVolumeStep);
-      continue;
-    }else if(keyp == NCKey::Down){
-      adjust_volume(-kNcplayerVolumeStep);
-      continue;
-    }else if(keyp == NCKey::Right){
-      marsh->request = PlaybackRequest::Seek;
-      marsh->seek_delta = shift_pressed ? kNcplayerSeekMinutes : kNcplayerSeekSeconds;
-      marsh->seek_absolute = false;
-      destroy_subtitle_plane();
-      return 2;
-    }else if(keyp == NCKey::Left){
-      marsh->request = PlaybackRequest::Seek;
-      marsh->seek_delta = shift_pressed ? -kNcplayerSeekMinutes : -kNcplayerSeekSeconds;
-      marsh->seek_absolute = false;
-      destroy_subtitle_plane();
-      return 2;
     }else if(keyp != 'q'){
       continue;
     }
@@ -1100,6 +1205,8 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
     // Preserve drop statistics across seeks
     uint64_t cumulative_dropped_frames = 0;
     int cumulative_framecount = 0;
+    // Preserve pause state across seeks/resizes
+    bool is_paused = false;
     while(true){
       logdebug("[stream] begin iteration %d (need_recreate=%d, audio=%d)", stream_iteration++, needs_plane_recreate ? 1 : 0, audio_thread ? 1 : 0);
       bool restart_stream = false;
@@ -1159,6 +1266,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .timing_offset_ns = 0,
         .last_displayed_video_seconds = -1.0,
         .consecutive_video_ahead_count = 0,
+        .is_paused = is_paused,
       };
       // Set up wrapper structure to pass drop check callback and original curry
       struct ncplayer_stream_curry stream_curry = {
@@ -1177,6 +1285,8 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         pending_seek_absolute = marsh.seek_absolute;
       }
       show_fps_overlay = marsh.show_fps;
+      // Preserve pause state across stream restarts
+      is_paused = marsh.is_paused;
       if(audio_thread && !preserve_audio){
         const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
         const int iter = stream_iteration - 1;
