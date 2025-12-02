@@ -370,7 +370,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   struct ncplane* subp = recreate_subtitle_plane();
   auto destroy_subtitle_plane = [&](){
     if(subp){
-      ncplane_destroy(subp);
+      ncplane_family_destroy(subp);
       subp = nullptr;
     }
   };
