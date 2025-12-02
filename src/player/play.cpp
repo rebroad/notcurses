@@ -289,8 +289,10 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         double current_session_play_time = elapsed / 1000.0;
         double total_play_time = *marsh->cumulative_play_time_seconds + current_session_play_time;
 
-        // Calculate FPS from total frames / total play time
-        if(total_play_time > 0.0){
+        // Calculate FPS from total frames rendered (not dropped) / total play time
+        // framecount is the number of frames actually rendered
+        // total_play_time = cumulative_play_time_seconds + current_session_play_time
+        if(total_play_time > 0.01){ // Require at least 10ms of play time for accuracy
           marsh->current_fps = marsh->framecount / total_play_time;
         }
       }else{
@@ -303,11 +305,29 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
           *marsh->play_time_tracking_active = false;
         }
         // FPS remains at last calculated value while paused
+        // Recalculate from cumulative values in case we just paused
+        double total_play_time = *marsh->cumulative_play_time_seconds;
+        if(total_play_time > 0.01 && marsh->framecount > 0){
+          marsh->current_fps = marsh->framecount / total_play_time;
+        }
       }
 
       // Calculate drop percentage from cumulative values
       const uint64_t total_attempted = marsh->framecount + marsh->dropped_frames;
       marsh->current_drop_pct = total_attempted ? (100.0 * marsh->dropped_frames / total_attempted) : 0.0;
+    }else{
+      // Pointers not set - calculate FPS from current session only (fallback)
+      // This shouldn't happen in normal operation, but provides a fallback
+      if(marsh->framecount > 0 && !marsh->is_paused){
+        // Use a rough estimate - this is not ideal but better than 0
+        static auto session_start = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - session_start).count();
+        double session_time = elapsed / 1000.0;
+        if(session_time > 0.01){
+          marsh->current_fps = marsh->framecount / session_time;
+        }
+      }
 
       // Check if FPS is below target
       const uint64_t expected_frame_ns_snapshot = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
