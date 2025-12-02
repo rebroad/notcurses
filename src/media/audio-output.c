@@ -263,13 +263,24 @@ API void audio_output_resume(audio_output* ao) {
 API int audio_output_write(audio_output* ao, const uint8_t* data, size_t len) {
   if (!ao || !data) return -1;
 
+  // Check if buffer is valid (protect against use-after-free)
+  if (!ao->buffer || ao->buffer_size == 0) {
+    return -1;
+  }
+
   pthread_mutex_lock(&ao->mutex);
+
+  // Double-check buffer is still valid after acquiring lock
+  if (!ao->buffer || ao->buffer_size == 0) {
+    pthread_mutex_unlock(&ao->mutex);
+    return -1;
+  }
 
   // Wait if buffer is too full
   size_t available_space = ao->buffer_size - ao->buffer_used;
   while (len > available_space) {
     pthread_cond_wait(&ao->cond, &ao->mutex);
-    if (!ao->playing) {
+    if (!ao->playing || !ao->buffer || ao->buffer_size == 0) {
       pthread_mutex_unlock(&ao->mutex);
       return -1;
     }
@@ -278,8 +289,22 @@ API int audio_output_write(audio_output* ao, const uint8_t* data, size_t len) {
 
   // Ensure data is contiguous at buffer start before writing
   if (ao->buffer_pos > 0 && ao->buffer_used > 0) {
+    // Validate buffer bounds before memmove
+    if (ao->buffer_pos + ao->buffer_used > ao->buffer_size) {
+      // Buffer corruption detected - reset
+      ao->buffer_pos = 0;
+      ao->buffer_used = 0;
+      pthread_mutex_unlock(&ao->mutex);
+      return -1;
+    }
     memmove(ao->buffer, ao->buffer + ao->buffer_pos, ao->buffer_used);
     ao->buffer_pos = 0;
+  }
+
+  // Validate we have space before writing
+  if (ao->buffer_used + len > ao->buffer_size) {
+    pthread_mutex_unlock(&ao->mutex);
+    return -1;
   }
 
   memcpy(ao->buffer + ao->buffer_used, data, len);

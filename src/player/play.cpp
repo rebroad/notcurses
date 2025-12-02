@@ -365,11 +365,20 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   // Use the position we'd use for display (last displayed or current if first frame)
   if(global_audio != nullptr){
     double audio_seconds = audio_output_get_clock(global_audio);
+    double video_pos_for_sync = marsh->last_displayed_video_seconds >= 0.0
+                                 ? marsh->last_displayed_video_seconds
+                                 : current_video_seconds;
+    double current_diff = video_pos_for_sync - audio_seconds;
+
+    // Debug logging for large discrepancies
+    if(std::fabs(current_diff) > 1.0){ // More than 1 second difference
+      logwarn("[av-sync] DEBUG large diff: video=%.4fs, audio=%.4fs, diff=%.4fs, "
+              "last_displayed=%.4fs, current=%.4fs, frame=%06d",
+              video_pos_for_sync, audio_seconds, current_diff,
+              marsh->last_displayed_video_seconds, current_video_seconds, marsh->framecount);
+    }
+
     if(std::isfinite(audio_seconds) && audio_seconds > 0.0){
-      double video_pos_for_sync = marsh->last_displayed_video_seconds >= 0.0
-                                   ? marsh->last_displayed_video_seconds
-                                   : current_video_seconds;
-      double current_diff = video_pos_for_sync - audio_seconds;
       if(std::fabs(current_diff) > threshold_seconds){
         int new_state = current_diff > 0.0 ? 1 : -1;
         if(marsh->av_sync_state != new_state){
@@ -394,6 +403,12 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         marsh->av_sync_state = 0;
         marsh->consecutive_video_ahead_count = 0; // Reset counter when in sync
       }
+    }else{
+      // Audio clock is invalid - log this occasionally
+      static int invalid_clock_log_count = 0;
+      if((invalid_clock_log_count++ % 60) == 0){ // Log every 60 frames
+        logwarn("[av-sync] audio clock invalid: %.4fs (frame %06d)", audio_seconds, marsh->framecount);
+      }
     }
   }
 
@@ -405,17 +420,25 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   // the issue is that audio isn't advancing, not that video is too fast.
   if(marsh->consecutive_video_ahead_count > 1 && global_audio != nullptr){
     double audio_seconds = audio_output_get_clock(global_audio);
+    double video_pos = marsh->last_displayed_video_seconds >= 0.0
+                       ? marsh->last_displayed_video_seconds
+                       : current_video_seconds;
+    double diff_seconds = video_pos - audio_seconds;
+    bool audio_enabled = ffmpeg_is_audio_enabled(ncv);
+
+    // Add detailed debug logging to understand the issue
+    logwarn("[av-sync] video ahead by %.2fms (frame %06d) - DEBUG: video=%.4fs, audio=%.4fs, "
+            "audio_enabled=%d, last_displayed=%.4fs, current=%.4fs",
+            diff_seconds * 1e3, marsh->framecount, video_pos, audio_seconds,
+            audio_enabled ? 1 : 0, marsh->last_displayed_video_seconds, current_video_seconds);
+
     if(std::isfinite(audio_seconds) && audio_seconds > 0.0){
-      double video_pos = marsh->last_displayed_video_seconds >= 0.0
-                         ? marsh->last_displayed_video_seconds
-                         : current_video_seconds;
-      double diff_seconds = video_pos - audio_seconds;
       if(diff_seconds > threshold_seconds){
         // Log the issue but don't sleep - sleeping makes it worse
-        logwarn("[av-sync] video ahead by %.2fms (frame %06d) - audio clock may not be advancing. "
-                "Check if audio thread is running and writing samples.",
-                diff_seconds * 1e3, marsh->framecount);
+        logwarn("[av-sync] audio clock may not be advancing. Check if audio thread is running and writing samples.");
       }
+    }else{
+      logwarn("[av-sync] audio clock is invalid (%.4fs) - audio output may not be initialized correctly", audio_seconds);
     }
   }
 
@@ -650,21 +673,35 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     double video_pos_at_unpause = ffmpeg_get_video_position_seconds(ncv);
     audio_output* ao_unpause = audio_output_get_global();
     double audio_pos_at_unpause = ao_unpause ? audio_output_get_clock(ao_unpause) : -1.0;
-    loginfo("[pause] UNPAUSED at frame %06d, video=%.4fs, audio=%.4fs, timing_offset=%.2fms",
+    loginfo("[pause] UNPAUSED at frame %06d, video=%.4fs, audio=%.4fs, timing_offset=%.2fms, "
+            "audio_enabled_before_pause=%d, ao=%p",
             marsh->framecount, video_pos_at_unpause, audio_pos_at_unpause,
-            static_cast<double>(marsh->timing_offset_ns) / 1e6);
+            static_cast<double>(marsh->timing_offset_ns) / 1e6,
+            audio_enabled_before_pause ? 1 : 0, ao_unpause);
     if(audio_enabled_before_pause){
       // Set audio clock to match CURRENT video position for sync
       // Use video_pos_at_unpause (not video_pos_at_pause) in case user sought during pause
-      if(ao_unpause && std::isfinite(video_pos_at_unpause) && video_pos_at_unpause >= 0.0){
-        audio_output_set_pts(ao_unpause, static_cast<uint64_t>(video_pos_at_unpause * 1e9), 1e-9);
-        logdebug("[pause] restored audio clock to %.4fs (current video position)", video_pos_at_unpause);
-        // Ensure audio is started so the clock can advance
-        audio_output_start(ao_unpause);
-        logdebug("[pause] started audio output to allow clock to advance");
+      if(ao_unpause){
+        if(std::isfinite(video_pos_at_unpause) && video_pos_at_unpause >= 0.0){
+          logdebug("[pause] setting audio clock from %.4fs to %.4fs (current video position)",
+                   audio_pos_at_unpause, video_pos_at_unpause);
+          audio_output_set_pts(ao_unpause, static_cast<uint64_t>(video_pos_at_unpause * 1e9), 1e-9);
+          // Verify the clock was set correctly
+          double verify_clock = audio_output_get_clock(ao_unpause);
+          logdebug("[pause] audio clock set to %.4fs (verified: %.4fs)", video_pos_at_unpause, verify_clock);
+          // Ensure audio is started so the clock can advance
+          audio_output_start(ao_unpause);
+          logdebug("[pause] started audio output to allow clock to advance");
+        }else{
+          logwarn("[pause] video position invalid (%.4fs), cannot set audio clock", video_pos_at_unpause);
+        }
+      }else{
+        logwarn("[pause] audio output is null, cannot set clock or start audio");
       }
       ffmpeg_set_audio_enabled(ncv, true);
       logdebug("[pause] re-enabled audio after unpause");
+    }else{
+      logdebug("[pause] audio was not enabled before pause, not restoring audio clock");
     }
     return 0; // unpaused successfully
   };
@@ -1250,11 +1287,14 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         if(ao){
           const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
           const int iter = stream_iteration - 1;
+          logdebug("[audio] initialized audio output (iteration %d, ao=%p)", iter, ao);
           // Initialize audio clock to current media position (not 0)
           // so A/V sync tracking reflects actual media time
           if(std::isfinite(audio_pos) && audio_pos >= 0.0){
             audio_output_set_pts(ao, static_cast<uint64_t>(audio_pos * 1e9), 1e-9);
-            logdebug("[audio] starting audio thread (iteration %d, media %.3fs, clock initialized)", iter, audio_pos);
+            double verify_clock = audio_output_get_clock(ao);
+            logdebug("[audio] starting audio thread (iteration %d, media %.3fs, clock set to %.3fs, verified: %.3fs)",
+                     iter, audio_pos, audio_pos, verify_clock);
           }else{
             logdebug("[audio] starting audio thread (iteration %d, media unknown)", iter);
           }
@@ -1276,10 +1316,15 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         ao = audio_output_init(sample_rate, channels, AV_SAMPLE_FMT_S16);
         if(ao){
           const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
+          logdebug("[audio] initialized audio output (paused, ao=%p)", ao);
           // Initialize audio clock to current media position for when we unpause
           if(std::isfinite(audio_pos) && audio_pos >= 0.0){
             audio_output_set_pts(ao, static_cast<uint64_t>(audio_pos * 1e9), 1e-9);
-            logdebug("[audio] initialized audio output (paused, media %.3fs, thread not started)", audio_pos);
+            double verify_clock = audio_output_get_clock(ao);
+            logdebug("[audio] initialized audio output (paused, media %.3fs, clock set to %.3fs, verified: %.3fs, thread not started)",
+                     audio_pos, audio_pos, verify_clock);
+          }else{
+            logdebug("[audio] initialized audio output (paused, media unknown, thread not started)");
           }
           // Don't start the thread or enable audio - we're paused
           ffmpeg_set_audio_enabled(*ncv, false);
@@ -1336,21 +1381,53 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         logdebug("[audio] unpause detected (was_paused=%d, is_paused=%d, has_audio=%d, thread=%p, ao=%p)",
                  was_paused ? 1 : 0, is_paused ? 1 : 0,
                  ffmpeg_has_audio(*ncv) ? 1 : 0, audio_thread, ao);
-        if(ffmpeg_has_audio(*ncv) && audio_thread == nullptr && ao != nullptr){
-          const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
-          logdebug("[audio] starting audio thread after unpause (media %.3fs)", audio_pos);
-          audio_running = true;
-          audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
-          audio_thread = new std::thread(audio_thread_func, audio_data);
-          audio_output_start(ao);
-          just_started_audio = true;
-        }else{
-          logdebug("[audio] not starting thread: has_audio=%d, thread=%p, ao=%p",
-                   ffmpeg_has_audio(*ncv) ? 1 : 0, audio_thread, ao);
+        if(ffmpeg_has_audio(*ncv)){
+          if(audio_thread == nullptr && ao != nullptr){
+            // Audio output exists but thread doesn't - start the thread
+            const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
+            logdebug("[audio] starting audio thread after unpause (media %.3fs)", audio_pos);
+            audio_running = true;
+            audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
+            audio_thread = new std::thread(audio_thread_func, audio_data);
+            audio_output_start(ao);
+            just_started_audio = true;
+          }else if(audio_thread != nullptr && ao != nullptr){
+            // Thread exists - ensure audio is enabled and output is started
+            logdebug("[audio] thread already running, ensuring audio is enabled and started");
+            ffmpeg_set_audio_enabled(*ncv, true);
+            audio_output_start(ao);
+          }else if(ao == nullptr){
+            // No audio output - need to initialize it
+            logdebug("[audio] no audio output, initializing");
+            int sample_rate = 44100;
+            int channels = ffmpeg_get_audio_channels(*ncv);
+            if(channels > 2){
+              channels = 2;
+            }
+            ao = audio_output_init(sample_rate, channels, AV_SAMPLE_FMT_S16);
+            if(ao){
+              const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
+              logdebug("[audio] initialized audio output on unpause (ao=%p)", ao);
+              if(std::isfinite(audio_pos) && audio_pos >= 0.0){
+                audio_output_set_pts(ao, static_cast<uint64_t>(audio_pos * 1e9), 1e-9);
+                double verify_clock = audio_output_get_clock(ao);
+                logdebug("[audio] set clock to %.3fs (verified: %.3fs)", audio_pos, verify_clock);
+              }
+              audio_running = true;
+              audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
+              audio_thread = new std::thread(audio_thread_func, audio_data);
+              audio_output_start(ao);
+              just_started_audio = true;
+            }
+          }else{
+            logdebug("[audio] not starting thread: has_audio=%d, thread=%p, ao=%p",
+                     ffmpeg_has_audio(*ncv) ? 1 : 0, audio_thread, ao);
+          }
         }
       }
       // Only stop/destroy audio if we're restarting the stream (r == 2) and not preserving audio
       // Don't destroy if we just started the thread (we want to keep it running)
+      // CRITICAL: Stop the thread BEFORE destroying the audio output to prevent use-after-free
       if(audio_thread && !preserve_audio && r == 2 && !just_started_audio){
         const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
         const int iter = stream_iteration - 1;
@@ -1361,16 +1438,32 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
           logdebug("[audio] stopping audio thread (iteration %d, media unknown, frame %06d)",
                    iter, marsh.framecount);
         }
+        // Stop the thread first
         audio_running = false;
+        // Wake up the thread if it's waiting
+        if(ao){
+          audio_output_pause(ao);
+        }
         audio_thread->join();
         delete audio_thread;
         audio_thread = nullptr;
       }
+      // Now safe to delete audio_data and destroy audio output
       if(audio_data && !preserve_audio){
         delete audio_data;
         audio_data = nullptr;
       }
       if(ao && !preserve_audio){
+        // Thread should be stopped by now, but double-check
+        if(audio_thread){
+          logwarn("[audio] destroying audio output while thread still exists - stopping thread first");
+          audio_running = false;
+          audio_output_pause(ao);
+          audio_thread->join();
+          delete audio_thread;
+          audio_thread = nullptr;
+        }
+        logdebug("[audio] destroying audio output (ao=%p, preserve_audio=%d)", ao, preserve_audio ? 1 : 0);
         audio_output_destroy(ao);
         ao = nullptr;
       }
@@ -1416,9 +1509,11 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
           pending_request = PlaybackRequest::None;
           restart_stream = true;
           pending_seek_value = 0.0;
+          // Preserve audio during seeks to avoid destroying the output while thread is running
+          // This prevents crashes when the audio thread tries to write to a destroyed buffer
+          preserve_audio = true;
           if(was_absolute){
             needs_plane_recreate = true;
-            preserve_audio = true;
           }
         }else{
           logerror("[seek] ncvisual_seek failed");
