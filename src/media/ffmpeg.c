@@ -1939,29 +1939,158 @@ ffmpeg_seek_relative(ncvisual* ncv, double seconds){
     current = (stream->start_time != AV_NOPTS_VALUE) ? stream->start_time : 0;
   }
   int64_t offset = seconds / time_base;
-  int64_t target = current + offset;
-  if(target < 0){
-    target = 0;
+  int64_t target_pts = current + offset;
+  if(target_pts < 0){
+    target_pts = 0;
   }
-  int flags = 0;
-  if(seconds < 0){
-    flags |= AVSEEK_FLAG_BACKWARD;
+  double target_seconds = target_pts * time_base;
+
+  // Clamp to valid duration if available
+  if(stream->duration > 0 && target_pts > stream->duration){
+    target_pts = stream->duration;
+    target_seconds = target_pts * time_base;
   }
-  if(av_seek_frame(fmt, stream_index, target, flags) < 0){
-    // clamp to valid duration if available
-    if(stream->duration > 0 && target > stream->duration){
-      target = stream->duration;
-      if(av_seek_frame(fmt, stream_index, target, AVSEEK_FLAG_BACKWARD) < 0){
-        return -1;
-      }
-    }else{
+
+  // First, try to seek with BACKWARD flag to get a keyframe before or at the target
+  int64_t seek_pts = target_pts;
+  if(av_seek_frame(fmt, stream_index, seek_pts, AVSEEK_FLAG_BACKWARD) < 0){
+    // If backward seek fails, try forward seek
+    if(av_seek_frame(fmt, stream_index, seek_pts, 0) < 0){
       return -1;
     }
   }
+
+  // Flush codec buffers
   avcodec_flush_buffers(ncv->details->codecctx);
   ncv->details->packet_outstanding = false;
   av_packet_unref(ncv->details->packet);
-  ncv->details->last_video_frame_pts = target;
+
+  // Decode first frame to see where we actually landed
+  if(ffmpeg_decode(ncv) < 0){
+    return -1;
+  }
+
+  // Get the actual position after decode
+  int64_t actual_pts = ncv->details->last_video_frame_pts;
+  if(actual_pts == AV_NOPTS_VALUE){
+    // Can't determine position, use target as fallback
+    ncv->details->last_video_frame_pts = target_pts;
+    actual_pts = target_pts;
+  }
+
+  double actual_seconds = actual_pts * time_base;
+  double diff_seconds = actual_seconds - target_seconds;
+
+  // If we're ahead of target by more than 100ms, try to find a better keyframe
+  // Scan backwards up to 5 seconds looking for a keyframe closer to or before the target
+  const double max_scan_back_seconds = 5.0;
+  const double scan_step_seconds = 0.5; // Try every 0.5 seconds for finer granularity
+  const double tolerance_seconds = 0.05; // 50ms tolerance - close enough
+
+  if(diff_seconds > tolerance_seconds && diff_seconds <= max_scan_back_seconds + 1.0){
+    logdebug("[seek] initial position %.3fs is %.3fs ahead of target %.3fs, scanning backwards",
+             actual_seconds, diff_seconds, target_seconds);
+
+    int64_t best_pts = actual_pts;
+    double best_diff = diff_seconds;
+    bool found_before_target = false;
+
+    // Try seeking backwards in steps, starting from just before target
+    for(double scan_back = scan_step_seconds; scan_back <= max_scan_back_seconds; scan_back += scan_step_seconds){
+      int64_t scan_pts = target_pts - (int64_t)(scan_back / time_base);
+      if(scan_pts < 0){
+        scan_pts = 0;
+      }
+
+      if(av_seek_frame(fmt, stream_index, scan_pts, AVSEEK_FLAG_BACKWARD) == 0){
+        avcodec_flush_buffers(ncv->details->codecctx);
+        ncv->details->packet_outstanding = false;
+        av_packet_unref(ncv->details->packet);
+
+        // Decode frame to get actual position
+        if(ffmpeg_decode(ncv) >= 0){
+          int64_t candidate_pts = ncv->details->last_video_frame_pts;
+          if(candidate_pts != AV_NOPTS_VALUE){
+            double candidate_seconds = candidate_pts * time_base;
+            double candidate_diff = candidate_seconds - target_seconds;
+
+            // Prefer keyframes at or before target (candidate_diff <= 0)
+            // If we find one before target, prefer the one closest to target (largest negative diff)
+            // If all are after target, prefer the one closest to target (smallest positive diff)
+            bool is_better = false;
+            if(candidate_diff <= 0.0){
+              if(!found_before_target || candidate_diff > best_diff){
+                is_better = true;
+                found_before_target = true;
+              }
+            }else if(!found_before_target && candidate_diff < best_diff){
+              is_better = true;
+            }
+
+            if(is_better){
+              best_pts = candidate_pts;
+              best_diff = candidate_diff;
+              logdebug("[seek] found better keyframe at %.3fs (diff=%.3fs)", candidate_seconds, candidate_diff);
+
+              // If we found a keyframe at or very close to target, we're done
+              if(candidate_diff <= tolerance_seconds && candidate_diff >= -tolerance_seconds){
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Seek to the best keyframe we found
+    if(best_pts != actual_pts){
+      if(av_seek_frame(fmt, stream_index, best_pts, AVSEEK_FLAG_BACKWARD) == 0){
+        avcodec_flush_buffers(ncv->details->codecctx);
+        ncv->details->packet_outstanding = false;
+        av_packet_unref(ncv->details->packet);
+        if(ffmpeg_decode(ncv) < 0){
+          return -1;
+        }
+        actual_pts = ncv->details->last_video_frame_pts;
+        if(actual_pts == AV_NOPTS_VALUE){
+          actual_pts = best_pts;
+          ncv->details->last_video_frame_pts = best_pts;
+        }
+        actual_seconds = actual_pts * time_base;
+        diff_seconds = actual_seconds - target_seconds;
+        logdebug("[seek] using best keyframe at %.3fs (diff=%.3fs from target)", actual_seconds, diff_seconds);
+      }
+    }
+  }
+
+  // Now decode frames forward until we reach the target (or close to it)
+  // We'll decode up to a reasonable number of frames to reach the target
+  const int max_decode_frames = 150; // ~5 seconds at 30fps
+  int decoded_count = 0;
+
+  while(actual_seconds < target_seconds - 0.05 && decoded_count < max_decode_frames){
+    if(ffmpeg_decode(ncv) < 0){
+      break; // Can't decode more, stop here
+    }
+    decoded_count++;
+    actual_pts = ncv->details->last_video_frame_pts;
+    if(actual_pts == AV_NOPTS_VALUE){
+      break;
+    }
+    actual_seconds = actual_pts * time_base;
+
+    // If we've passed the target, stop
+    if(actual_seconds >= target_seconds){
+      break;
+    }
+  }
+
+  if(decoded_count > 0){
+    logdebug("[seek] decoded %d frames forward to reach %.3fs (target was %.3fs, diff=%.3fs)",
+             decoded_count, actual_seconds, target_seconds, actual_seconds - target_seconds);
+  }
+
+  // Update decoded_frames count
   double frame_rate = av_q2d(stream->avg_frame_rate);
   if(frame_rate <= 0.0){
     frame_rate = 1.0 / av_q2d(stream->time_base);
@@ -1969,11 +2098,13 @@ ffmpeg_seek_relative(ncvisual* ncv, double seconds){
       frame_rate = 30.0;
     }
   }
-  double seconds_pos = target * time_base;
-  if(seconds_pos < 0){
-    seconds_pos = 0;
+  double final_seconds = actual_pts * time_base;
+  if(final_seconds < 0){
+    final_seconds = 0;
   }
-  ncv->details->decoded_frames = (int64_t)(seconds_pos * frame_rate);
+  ncv->details->decoded_frames = (int64_t)(final_seconds * frame_rate);
+
+  // Flush audio buffers
   if(ncv->details->audiocodecctx){
     avcodec_flush_buffers(ncv->details->audiocodecctx);
     pthread_mutex_lock(&ncv->details->audio_packet_mutex);
@@ -1982,9 +2113,7 @@ ffmpeg_seek_relative(ncvisual* ncv, double seconds){
     pthread_mutex_unlock(&ncv->details->audio_packet_mutex);
     ncv->details->last_audio_frame_pts = AV_NOPTS_VALUE;
   }
-  if(ffmpeg_decode(ncv) < 0){
-    return -1;
-  }
+
   return 0;
 }
 
