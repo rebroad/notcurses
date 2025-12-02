@@ -181,39 +181,6 @@ static constexpr uint64_t kNcplayerDefaultFrameNs = 41666667ull; // ~24fps
 static constexpr double kNcplayerFpsFloorRatio = 0.9;            // 90%
 static constexpr double kNcplayerAvSyncDropThreshold = 1.5;      // drop frames when video is behind audio by this many frames
 
-static std::string
-format_hms(double seconds){
-  if(!std::isfinite(seconds)){
-    return "unknown";
-  }
-  bool negative = seconds < 0.0;
-  double abs_seconds = std::fabs(seconds);
-  int hours = static_cast<int>(abs_seconds / 3600.0);
-  abs_seconds -= hours * 3600.0;
-  int minutes = static_cast<int>(abs_seconds / 60.0);
-  abs_seconds -= minutes * 60.0;
-  double secs = abs_seconds;
-  int whole_secs = static_cast<int>(secs);
-  double frac = secs - whole_secs;
-  int frac_part = static_cast<int>(std::round(frac * 10000.0));
-  if(frac_part == 10000){
-    frac_part = 0;
-    ++whole_secs;
-    if(whole_secs == 60){
-      whole_secs = 0;
-      ++minutes;
-      if(minutes == 60){
-        minutes = 0;
-        ++hours;
-      }
-    }
-  }
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), "%s%02d:%02d:%02d.%04d",
-                negative ? "-" : "", hours, minutes, whole_secs, frac_part);
-  return std::string(buf);
-}
-
 // C-compatible wrapper structure matching the one in ffmpeg.c
 extern "C" {
 struct ncplayer_stream_curry {
@@ -420,6 +387,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
         }
       }else if(marsh->av_sync_state != 0){
         double diff_ms = current_diff * 1e3;
+        double threshold_ms = threshold_seconds * 1e3;
         loginfo("[av-sync] <threshold %.2fms, frame %06d, audio offset %+.2fms",
                 threshold_ms, marsh->framecount, diff_ms);
         marsh->av_sync_state = 0;
@@ -1129,6 +1097,9 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
     bool pending_seek_absolute = false;
     bool preserve_audio = false;
     int stream_iteration = 0;
+    // Preserve drop statistics across seeks
+    uint64_t cumulative_dropped_frames = 0;
+    int cumulative_framecount = 0;
     while(true){
       logdebug("[stream] begin iteration %d (need_recreate=%d, audio=%d)", stream_iteration++, needs_plane_recreate ? 1 : 0, audio_thread ? 1 : 0);
       bool restart_stream = false;
@@ -1168,12 +1139,12 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       }
 
       struct marshal marsh = {
-        .framecount = 0,
+        .framecount = cumulative_framecount,
         .quiet = quiet,
         .blitter = vopts.blitter,
         .last_abstime_ns = 0,
         .avg_frame_ns = 0,
-        .dropped_frames = 0,
+        .dropped_frames = cumulative_dropped_frames,
         .show_fps = show_fps_overlay,
         .current_fps = 0.0,
         .current_drop_pct = 0.0,
@@ -1197,6 +1168,9 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       logdebug("[stream] starting ncvisual_stream iteration with %ux%u plane", vopts.n ? ncplane_dim_x(vopts.n) : 0, vopts.n ? ncplane_dim_y(vopts.n) : 0);
       r = ncv->stream(&vopts, timescale, perframe, &stream_curry);
       logdebug("[stream] ncvisual_stream returned %d", r);
+      // Preserve drop statistics before processing requests
+      cumulative_dropped_frames = marsh.dropped_frames;
+      cumulative_framecount = marsh.framecount;
       pending_request = marsh.request;
       if(pending_request == PlaybackRequest::Seek){
         pending_seek_value = marsh.seek_delta;
