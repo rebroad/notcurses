@@ -1332,14 +1332,22 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       // If we just unpaused and audio thread wasn't started (because we were paused during seek),
       // start it now so audio can play
       bool just_started_audio = false;
-      if(was_paused && !is_paused && ffmpeg_has_audio(*ncv) && audio_thread == nullptr && ao != nullptr){
-        const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
-        logdebug("[audio] starting audio thread after unpause (media %.3fs)", audio_pos);
-        audio_running = true;
-        audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
-        audio_thread = new std::thread(audio_thread_func, audio_data);
-        audio_output_start(ao);
-        just_started_audio = true;
+      if(was_paused && !is_paused){
+        logdebug("[audio] unpause detected (was_paused=%d, is_paused=%d, has_audio=%d, thread=%p, ao=%p)",
+                 was_paused ? 1 : 0, is_paused ? 1 : 0,
+                 ffmpeg_has_audio(*ncv) ? 1 : 0, audio_thread, ao);
+        if(ffmpeg_has_audio(*ncv) && audio_thread == nullptr && ao != nullptr){
+          const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
+          logdebug("[audio] starting audio thread after unpause (media %.3fs)", audio_pos);
+          audio_running = true;
+          audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
+          audio_thread = new std::thread(audio_thread_func, audio_data);
+          audio_output_start(ao);
+          just_started_audio = true;
+        }else{
+          logdebug("[audio] not starting thread: has_audio=%d, thread=%p, ao=%p",
+                   ffmpeg_has_audio(*ncv) ? 1 : 0, audio_thread, ao);
+        }
       }
       // Only stop/destroy audio if we're restarting the stream (r == 2) and not preserving audio
       // Don't destroy if we just started the thread (we want to keep it running)
@@ -1400,7 +1408,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
           double actual_pos = ffmpeg_get_video_position_seconds(*ncv);
           double position_diff = actual_pos - to_pos;
           if(std::fabs(position_diff) > 0.1){ // More than 100ms difference
-            logdebug("[seek] success, actual position %.3fs (target was %.3fs, diff=%.3fs, keyframe seek)", 
+            logdebug("[seek] success, actual position %.3fs (target was %.3fs, diff=%.3fs, keyframe seek)",
                      actual_pos, to_pos, position_diff);
           }else{
             logdebug("[seek] success, actual position %.3fs", actual_pos);
