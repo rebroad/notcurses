@@ -47,6 +47,7 @@ void ffmpeg_audio_request_packets(ncvisual* ncv);
 void ffmpeg_set_audio_enabled(ncvisual* ncv, bool enabled);
 bool ffmpeg_is_audio_enabled(ncvisual* ncv);
 double ffmpeg_get_video_position_seconds(const ncvisual* ncv);
+double ffmpeg_get_video_frame_rate(const ncvisual* ncv);
 // Forward declaration for wrapper structure
 struct ncplayer_stream_curry;
 }
@@ -183,6 +184,13 @@ struct marshal {
   bool* play_time_tracking_active; // whether we're currently tracking play time
   double max_duration_seconds; // maximum video duration to play (0 = no limit)
   double duration_start_seconds; // video position where duration tracking starts (for seeking)
+  uint64_t video_expected_frame_ns; // cached expected frame interval from video file (0 if not available)
+  // Audio frame statistics (updated by audio thread, read by main thread)
+  std::atomic<int> audio_frame_count_for_stats;
+  std::atomic<double> shortest_audio_duration;
+  std::atomic<double> longest_audio_duration;
+  std::atomic<double> total_audio_duration;
+  std::chrono::steady_clock::time_point last_stats_log;
 };
 
 static constexpr double kNcplayerSeekSeconds = 5.0;
@@ -295,6 +303,12 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   }
 
   std::unique_ptr<Plane> stdn(nc.get_stdplane());
+
+  // Calculate expected frame interval once per frame (uses cached video frame rate)
+  const uint64_t expected_frame_ns = marsh->video_expected_frame_ns > 0
+    ? marsh->video_expected_frame_ns
+    : (marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs);
+
   // negative framecount means don't print framecount/timing (quiet mode)
   if(marsh->framecount >= 0){
     int64_t idx = ncvisual_frame_index(ncv);
@@ -361,9 +375,8 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     }
 
     // Check if FPS is below or above target (check regardless of whether pointers are set)
-    const uint64_t expected_frame_ns_snapshot = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
-    if(expected_frame_ns_snapshot > 0){
-      const double expected_fps_snapshot = static_cast<double>(NANOSECS_IN_SEC) / expected_frame_ns_snapshot;
+    if(expected_frame_ns > 0){
+      const double expected_fps_snapshot = static_cast<double>(NANOSECS_IN_SEC) / expected_frame_ns;
       const double fps_floor = expected_fps_snapshot * kNcplayerFpsFloorRatio;
       const double fps_ceiling = expected_fps_snapshot * 1.10; // 110% of expected
       const bool fps_is_low = marsh->current_fps > 0.0 && marsh->current_fps < fps_floor;
@@ -410,6 +423,55 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
                 marsh->current_fps, expected_fps_snapshot,
                 marsh->framecount, total_play_time_for_log);
         marsh->fps_off_target = false;
+      }
+    }
+
+    // Log audio frame statistics periodically (every 5 seconds)
+    if(ffmpeg_has_audio(ncv)){
+      auto now_stats = std::chrono::steady_clock::now();
+      auto elapsed_stats = std::chrono::duration_cast<std::chrono::milliseconds>(now_stats - marsh->last_stats_log).count();
+      int audio_frame_count = marsh->audio_frame_count_for_stats.load(std::memory_order_relaxed);
+      if(elapsed_stats >= 5000 && audio_frame_count > 0){
+        double shortest = marsh->shortest_audio_duration.load(std::memory_order_relaxed);
+        double longest = marsh->longest_audio_duration.load(std::memory_order_relaxed);
+        double total = marsh->total_audio_duration.load(std::memory_order_relaxed);
+        double avg_duration = total / audio_frame_count;
+        int video_frame_count = marsh->framecount >= 0 ? marsh->framecount : 0;
+        int audio_sample_rate = ffmpeg_get_audio_sample_rate(ncv);
+        if(audio_sample_rate <= 0){
+          audio_sample_rate = 44100; // Default fallback
+        }
+
+        // Build duration string - only show shortest/average/longest if they differ
+        char duration_str[256];
+        const double shortest_ms = shortest * 1000.0;
+        const double avg_ms = avg_duration * 1000.0;
+        const double longest_ms = longest * 1000.0;
+        const double epsilon = 0.001; // 0.001ms tolerance for floating point comparison
+
+        if(std::fabs(shortest_ms - avg_ms) < epsilon && std::fabs(avg_ms - longest_ms) < epsilon){
+          // All values are the same
+          snprintf(duration_str, sizeof(duration_str), "audio=%.3fms", avg_ms);
+        }else{
+          // Values differ, show all three
+          snprintf(duration_str, sizeof(duration_str), "shortest=%.3fms, average=%.3fms, longest=%.3fms",
+                   shortest_ms, avg_ms, longest_ms);
+        }
+
+        // Calculate video/audio frame ratio
+        double frame_ratio = audio_frame_count > 0
+          ? static_cast<double>(video_frame_count) / audio_frame_count
+          : 0.0;
+
+        logdebug("[stats] frame duration: %s (from %d audio frames, %d video frames, ratio=%.3f, sample_rate=%dHz)",
+                 duration_str, audio_frame_count, video_frame_count, frame_ratio, audio_sample_rate);
+
+        // Reset stats for next period (audio thread will start accumulating again)
+        marsh->shortest_audio_duration.store(std::numeric_limits<double>::max(), std::memory_order_relaxed);
+        marsh->longest_audio_duration.store(0.0, std::memory_order_relaxed);
+        marsh->total_audio_duration.store(0.0, std::memory_order_relaxed);
+        marsh->audio_frame_count_for_stats.store(0, std::memory_order_relaxed);
+        marsh->last_stats_log = now_stats;
       }
     }
   }
@@ -497,7 +559,6 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     }
   }
   marsh->last_abstime_ns = target_ns;
-  const uint64_t expected_frame_ns = marsh->avg_frame_ns ? marsh->avg_frame_ns : kNcplayerDefaultFrameNs;
 
   double current_video_seconds = media_seconds >= 0.0 ? media_seconds : (static_cast<double>(display_ns) / 1e9);
   audio_output* global_audio = audio_output_get_global();
@@ -1198,6 +1259,7 @@ struct audio_thread_data {
   std::atomic<bool>* running;
   std::mutex* mutex;
   std::atomic<int>* volume_percent;
+  struct marshal* marsh; // For updating audio frame statistics
 };
 
 // Audio thread function - processes decoded frames (video decoder reads packets)
@@ -1259,16 +1321,11 @@ static void audio_thread_func(audio_thread_data* data) {
   auto last_log = std::chrono::steady_clock::now();
   int frames_since_log = 0;
 
-  // Track audio frame duration statistics
+  // Track audio frame duration statistics (update marshal directly if available)
   int audio_sample_rate = ffmpeg_get_audio_sample_rate(ncv);
   if(audio_sample_rate <= 0){
     audio_sample_rate = 44100; // Default fallback
   }
-  double shortest_audio_duration = std::numeric_limits<double>::max();
-  double longest_audio_duration = 0.0;
-  double total_audio_duration = 0.0;
-  int audio_frame_count_for_stats = 0;
-  auto last_audio_stats_log = std::chrono::steady_clock::now();
 
   while(*running){
     bool audio_enabled = ffmpeg_is_audio_enabled(ncv);
@@ -1299,31 +1356,31 @@ static void audio_thread_func(audio_thread_data* data) {
       // Calculate audio frame duration: nb_samples / sample_rate
       double frame_duration = static_cast<double>(samples) / audio_sample_rate;
 
-      // Track duration statistics
-      if(frame_duration < shortest_audio_duration){
-        shortest_audio_duration = frame_duration;
-      }
-      if(frame_duration > longest_audio_duration){
-        longest_audio_duration = frame_duration;
-      }
-      total_audio_duration += frame_duration;
-      audio_frame_count_for_stats++;
+      // Update marshal stats atomically (main thread will log them)
+      if(data->marsh){
+        // Update count and total (simple atomic operations)
+        data->marsh->audio_frame_count_for_stats.fetch_add(1, std::memory_order_relaxed);
+        double old_total = data->marsh->total_audio_duration.load(std::memory_order_relaxed);
+        double new_total;
+        do {
+          new_total = old_total + frame_duration;
+        } while(!data->marsh->total_audio_duration.compare_exchange_weak(old_total, new_total, std::memory_order_relaxed));
 
-      // Log statistics periodically (every 5 seconds)
-      auto now_stats = std::chrono::steady_clock::now();
-      auto elapsed_stats = std::chrono::duration_cast<std::chrono::milliseconds>(now_stats - last_audio_stats_log).count();
-      if(elapsed_stats >= 5000 && audio_frame_count_for_stats > 0){
-        double avg_duration = total_audio_duration / audio_frame_count_for_stats;
-        logdebug("[audio] frame duration stats: shortest=%.3fms, average=%.3fms, longest=%.3fms "
-                 "(from %d frames, sample_rate=%dHz)",
-                 shortest_audio_duration * 1000.0, avg_duration * 1000.0, longest_audio_duration * 1000.0,
-                 audio_frame_count_for_stats, audio_sample_rate);
-        // Reset stats for next period
-        shortest_audio_duration = std::numeric_limits<double>::max();
-        longest_audio_duration = 0.0;
-        total_audio_duration = 0.0;
-        audio_frame_count_for_stats = 0;
-        last_audio_stats_log = now_stats;
+        // Update min (compare-and-swap loop)
+        double old_min = data->marsh->shortest_audio_duration.load(std::memory_order_relaxed);
+        while(frame_duration < old_min){
+          if(data->marsh->shortest_audio_duration.compare_exchange_weak(old_min, frame_duration, std::memory_order_relaxed)){
+            break;
+          }
+        }
+
+        // Update max (compare-and-swap loop)
+        double old_max = data->marsh->longest_audio_duration.load(std::memory_order_relaxed);
+        while(frame_duration > old_max){
+          if(data->marsh->longest_audio_duration.compare_exchange_weak(old_max, frame_duration, std::memory_order_relaxed)){
+            break;
+          }
+        }
       }
       do{
         consecutive_eagain = 0;
@@ -1558,7 +1615,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
             logdebug("[audio] starting audio thread (iteration %d, media unknown)", iter);
           }
           audio_running = true;
-          audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
+          audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent, nullptr};
           audio_thread = new std::thread(audio_thread_func, audio_data);
           audio_output_start(ao);
         }else{
@@ -1607,6 +1664,13 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         play_time_tracking_active = false;
       }
 
+      // Cache the video frame rate once at initialization
+      uint64_t video_expected_frame_ns = 0;
+      double video_frame_rate = ffmpeg_get_video_frame_rate(*ncv);
+      if(video_frame_rate > 0.0){
+        video_expected_frame_ns = static_cast<uint64_t>(NANOSECS_IN_SEC / video_frame_rate);
+      }
+
       struct marshal marsh = {
         .framecount = cumulative_framecount,
         .quiet = quiet,
@@ -1634,6 +1698,12 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .play_time_tracking_active = &play_time_tracking_active,
         .max_duration_seconds = max_duration,
         .duration_start_seconds = duration_start_seconds, // Set from function scope (updated when seeking)
+        .video_expected_frame_ns = video_expected_frame_ns,
+        .audio_frame_count_for_stats = 0,
+        .shortest_audio_duration = std::numeric_limits<double>::max(),
+        .longest_audio_duration = 0.0,
+        .total_audio_duration = 0.0,
+        .last_stats_log = std::chrono::steady_clock::now(),
       };
       // Seek to start position if specified (only on first iteration for this file)
       if(start_position >= 0.0 && stream_iteration == 0){
@@ -1650,6 +1720,10 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         }
       }
 
+      // Update audio thread data with marsh pointer if audio thread exists
+      if(audio_data){
+        audio_data->marsh = &marsh;
+      }
       // Set up wrapper structure to pass drop check callback and original curry
       struct ncplayer_stream_curry stream_curry = {
         .drop_check = ncplayer_should_drop_frame_impl,
@@ -1695,7 +1769,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
             const double audio_pos = ffmpeg_get_video_position_seconds(*ncv);
             logdebug("[audio] starting audio thread after unpause (media %.3fs)", audio_pos);
             audio_running = true;
-            audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
+            audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent, nullptr};
             audio_thread = new std::thread(audio_thread_func, audio_data);
             audio_output_start(ao);
             just_started_audio = true;
@@ -1722,7 +1796,7 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
                 logdebug("[audio] set clock to %.3fs (verified: %.3fs)", audio_pos, verify_clock);
               }
               audio_running = true;
-              audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent};
+              audio_data = new audio_thread_data{*ncv, ao, &audio_running, &audio_mutex, &volume_percent, nullptr};
               audio_thread = new std::thread(audio_thread_func, audio_data);
               audio_output_start(ao);
               just_started_audio = true;

@@ -1683,6 +1683,36 @@ ffmpeg_get_video_position_seconds(const ncvisual* ncv){
   return pts * time_base;
 }
 
+API double
+ffmpeg_get_video_frame_rate(const ncvisual* ncv){
+  if(!ncv || !ncv->details || !ncv->details->fmtctx){
+    return -1.0;
+  }
+  int stream_index = ncv->details->stream_index;
+  if(stream_index < 0 || stream_index >= (int)ncv->details->fmtctx->nb_streams){
+    return -1.0;
+  }
+  AVStream* stream = ncv->details->fmtctx->streams[stream_index];
+  if(!stream){
+    return -1.0;
+  }
+  double frame_rate = av_q2d(stream->avg_frame_rate);
+  if(frame_rate <= 0.0){
+    // Fallback to r_frame_rate if avg_frame_rate is not available
+    frame_rate = av_q2d(stream->r_frame_rate);
+    if(frame_rate <= 0.0){
+      // Last resort: calculate from time_base
+      double time_base = av_q2d(stream->time_base);
+      if(time_base > 0.0){
+        frame_rate = 1.0 / time_base;
+      }else{
+        return -1.0;
+      }
+    }
+  }
+  return frame_rate;
+}
+
 // Public API functions for audio handling (called from play.cpp)
 // Define API macro for visibility export
 
@@ -1761,6 +1791,9 @@ ffmpeg_init_audio_resampler(ncvisual* ncv, int out_sample_rate, int out_channels
 API int
 ffmpeg_get_decoded_audio_frame(ncvisual* ncv){
   if(!ncv || !ncv->details || ncv->details->audio_stream_index < 0){
+    return -1;
+  }
+  if(!ncv->details->audiocodecctx || !ncv->details->audio_frame){
     return -1;
   }
 
