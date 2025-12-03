@@ -8,7 +8,7 @@ ncplayer - Render images and video to a terminal
 
 # SYNOPSIS
 
-**ncplayer** [**-h**] [**-V**] [**-q**] [**-d** ***delaymult***] [**-l** ***loglevel***] [**-b** ***blitter***] [**-s** ***scalemode***] [**-k**] [**-L**] [**-t** ***seconds***] [**-n**] [**-a** ***color***] files
+**ncplayer** [**-h**] [**-V**] [**-q**] [**-d** ***delaymult***] [**-l** ***loglevel***] [**-b** ***blitter***] [**-s** ***scalemode***] [**-k**] [**-L**] [**-t** ***seconds***] [**-T** ***seconds***] [**-S** ***seconds***] [**-n**] [**-a** ***color***] files
 
 # DESCRIPTION
 
@@ -24,6 +24,17 @@ Only applies to multiframe media such as video and animated images. Not supporte
 **-t** ***seconds***: Delay **seconds** after each file. If this option is used,
 the "press any key to continue" prompt will not be displayed. **seconds** may
 be any non-negative number.
+
+**-T** ***seconds***: Exit after playing **seconds** of video content. This limits
+the playback duration based on the video file position, not wall-clock time.
+The duration is measured from the current playback position (or from the start
+if beginning playback). If a seek occurs, the duration is reset from the new
+position. **seconds** must be a positive number.
+
+**-S** ***seconds***: Start playing from this position in the video file. The
+video will seek to **seconds** before beginning playback. This is useful in
+combination with **-T** to play a specific segment of a video. **seconds** must
+be non-negative.
 
 **-l** ***loglevel***: Log between everything (loglevel 7) and nothing (loglevel 0) to stderr.
 

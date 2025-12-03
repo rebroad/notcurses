@@ -56,13 +56,15 @@ static void usage(std::ostream& os, const char* name, int exitcode)
   __attribute__ ((noreturn));
 
 void usage(std::ostream& o, const char* name, int exitcode){
-  o << "usage: " << name << " [ -h ] [ -q ] [ -m margins ] [ -l loglevel ] [ -d mult ] [ -s scaletype ] [ -k ] [ -L ] [ -t seconds ] [ -n ] [ -a color ] [ -v volume ] files" << '\n';
+  o << "usage: " << name << " [ -h ] [ -q ] [ -m margins ] [ -l loglevel ] [ -d mult ] [ -s scaletype ] [ -k ] [ -L ] [ -t seconds ] [ -T seconds ] [ -S seconds ] [ -n ] [ -a color ] [ -v volume ] files" << '\n';
   o << " -h: display help and exit with success\n";
   o << " -V: print program name and version\n";
   o << " -q: be quiet (no frame/timing information along top of screen)\n";
   o << " -k: use direct mode (cannot be used with -L or -d)\n";
   o << " -L: loop frames\n";
   o << " -t seconds: delay t seconds after each file\n";
+  o << " -T seconds: exit after playing for seconds (playback duration limit)\n";
+  o << " -S seconds: start playing from this position in the video file\n";
   o << " -l loglevel: integer between 0 and 7, goes to stderr\n";
   o << " -s scaling: one of 'none', 'hires', 'scale', 'scalehi', or 'stretch'\n";
   o << " -b blitter: one of 'ascii', 'half', 'quad', 'sex', 'oct', 'braille', or 'pixel'\n";
@@ -177,6 +179,8 @@ struct marshal {
   double* cumulative_play_time_seconds; // pointer to cumulative play time (excluding pause)
   std::chrono::steady_clock::time_point* play_start_time; // when current play session started
   bool* play_time_tracking_active; // whether we're currently tracking play time
+  double max_duration_seconds; // maximum video duration to play (0 = no limit)
+  double duration_start_seconds; // video position where duration tracking starts (for seeking)
 };
 
 static constexpr double kNcplayerSeekSeconds = 5.0;
@@ -267,6 +271,25 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
   auto* runtime = get_plane_runtime(vopts->n);
   if(runtime == nullptr){
     return -1;
+  }
+
+  // Check duration limit based on video position
+  if(marsh->max_duration_seconds > 0.0){
+    double current_video_seconds = ffmpeg_get_video_position_seconds(ncv);
+    if(current_video_seconds >= 0.0){
+      // Initialize start position on first frame
+      if(marsh->duration_start_seconds < 0.0){
+        marsh->duration_start_seconds = current_video_seconds;
+      }
+      // Calculate elapsed video time from start position
+      double elapsed_video_seconds = current_video_seconds - marsh->duration_start_seconds;
+      if(elapsed_video_seconds >= marsh->max_duration_seconds){
+        loginfo("[duration-limit] video position %.2fs >= start %.2fs + duration %.2fs, exiting", 
+                current_video_seconds, marsh->duration_start_seconds, marsh->max_duration_seconds);
+        marsh->request = PlaybackRequest::Quit;
+        return 1; // Signal quit
+      }
+    }
   }
 
   std::unique_ptr<Plane> stdn(nc.get_stdplane());
@@ -957,17 +980,20 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
 auto handle_opts(int argc, char** argv, notcurses_options& opts, bool* quiet,
                  float* timescale, ncscale_e* scalemode, ncblitter_e* blitter,
                  float* displaytime, bool* loop, bool* noninterp,
-                 uint32_t* transcolor, bool* climode, int* volume_percent)
+                 uint32_t* transcolor, bool* climode, int* volume_percent,
+                 double* max_duration, double* start_position)
                  -> int {
   *timescale = 1.0;
   *scalemode = NCSCALE_STRETCH;
   *displaytime = -1;
+  *max_duration = 0.0; // 0 means no limit
+  *start_position = -1.0; // -1 means start from beginning
   if(volume_percent){
     *volume_percent = std::clamp(*volume_percent, 0, 100);
   }
   bool volume_seen = false;
   int c;
-  while((c = getopt(argc, argv, "Vhql:d:s:b:t:m:kLa:nv:")) != -1){
+  while((c = getopt(argc, argv, "Vhql:d:s:b:t:T:S:m:kLa:nv:")) != -1){
     switch(c){
       case 'h':
         usage(std::cout, argv[0], EXIT_SUCCESS);
@@ -1051,6 +1077,28 @@ auto handle_opts(int argc, char** argv, notcurses_options& opts, bool* quiet,
           usage(std::cerr, argv[0], EXIT_FAILURE);
         }
         *displaytime = ts;
+        break;
+      }case 'T':{
+        std::stringstream ss;
+        ss << optarg;
+        double duration;
+        ss >> duration;
+        if(duration <= 0){
+          std::cerr << "Invalid max duration [" << optarg << "] (wanted (0..))\n";
+          usage(std::cerr, argv[0], EXIT_FAILURE);
+        }
+        *max_duration = duration;
+        break;
+      }case 'S':{
+        std::stringstream ss;
+        ss << optarg;
+        double start;
+        ss >> start;
+        if(start < 0){
+          std::cerr << "Invalid start position [" << optarg << "] (wanted [0..))\n";
+          usage(std::cerr, argv[0], EXIT_FAILURE);
+        }
+        *start_position = start;
         break;
       }case 'd':{
         std::stringstream ss;
@@ -1315,7 +1363,8 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
                                bool quiet, bool loop,
                                double timescale, double displaytime,
                                bool noninterp, uint32_t transcolor,
-                               bool climode, int initial_volume){
+                               bool climode, int initial_volume,
+                               double max_duration, double start_position){
   unsigned dimy, dimx;
   std::unique_ptr<Plane> stdn(nc.get_stdplane(&dimy, &dimx));
   if(climode){
@@ -1435,6 +1484,9 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
     bool pending_seek_absolute = false;
     bool preserve_audio = false;
     int stream_iteration = 0;
+    // Track duration start position (updated to new position when seeking)
+    // Initialize to start_position if specified, otherwise will be set on first frame
+    double duration_start_seconds = start_position >= 0.0 ? start_position : -1.0;
     // Preserve drop statistics across seeks
     uint64_t cumulative_dropped_frames = 0;
     int cumulative_framecount = 0;
@@ -1553,7 +1605,24 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .cumulative_play_time_seconds = &cumulative_play_time_seconds,
         .play_start_time = &play_start_time,
         .play_time_tracking_active = &play_time_tracking_active,
+        .max_duration_seconds = max_duration,
+        .duration_start_seconds = duration_start_seconds, // Set from function scope (updated when seeking)
       };
+      // Seek to start position if specified (only on first iteration for this file)
+      if(start_position >= 0.0 && stream_iteration == 0){
+        logdebug("[start] seeking to initial position %.3fs", start_position);
+        if(ncvisual_seek(*ncv, start_position) == 0){
+          double actual_pos = ffmpeg_get_video_position_seconds(*ncv);
+          logdebug("[start] seeked to %.3fs (target was %.3fs)", actual_pos, start_position);
+          // Update duration start position to the actual seek position
+          if(max_duration > 0.0 && std::isfinite(actual_pos) && actual_pos >= 0.0){
+            duration_start_seconds = actual_pos;
+          }
+        }else{
+          logwarn("[start] failed to seek to position %.3fs, starting from beginning", start_position);
+        }
+      }
+
       // Set up wrapper structure to pass drop check callback and original curry
       struct ncplayer_stream_curry stream_curry = {
         .drop_check = ncplayer_should_drop_frame_impl,
@@ -1565,6 +1634,10 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       // Preserve drop statistics before processing requests
       cumulative_dropped_frames = marsh.dropped_frames;
       cumulative_framecount = marsh.framecount;
+      // Update duration start position from marsh (in case it was set in perframe)
+      if(max_duration > 0.0 && marsh.duration_start_seconds >= 0.0){
+        duration_start_seconds = marsh.duration_start_seconds;
+      }
       // Accumulate play time if we were tracking and are now pausing
       if(marsh.is_paused && play_time_tracking_active){
         auto now = std::chrono::steady_clock::now();
@@ -1720,6 +1793,11 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
           }else{
             logdebug("[seek] success, actual position %.3fs", actual_pos);
           }
+          // Update duration start position to new seek position
+          // This means -T duration is measured from the current position after a seek
+          if(max_duration > 0.0 && std::isfinite(actual_pos) && actual_pos >= 0.0){
+            duration_start_seconds = actual_pos;
+          }
           pending_request = PlaybackRequest::None;
           restart_stream = true;
           pending_seek_value = 0.0;
@@ -1870,7 +1948,8 @@ int rendered_mode_player(int argc, char** argv, ncscale_e scalemode,
                          bool quiet, bool loop,
                          double timescale, double displaytime,
                          bool noninterp, uint32_t transcolor,
-                         bool climode, int initial_volume){
+                         bool climode, int initial_volume,
+                         double max_duration, double start_position){
   // no -k, we're using full rendered mode (and the alternate screen).
   ncopts.flags |= NCOPTION_INHIBIT_SETLOCALE;
   if(quiet){
@@ -1886,7 +1965,8 @@ int rendered_mode_player(int argc, char** argv, ncscale_e scalemode,
     }
     r = rendered_mode_player_inner(nc, argc, argv, scalemode, blitter,
                                    quiet, loop, timescale, displaytime,
-                                   noninterp, transcolor, climode, initial_volume);
+                                   noninterp, transcolor, climode, initial_volume,
+                                   max_duration, start_position);
     if(!nc.stop()){
       return -1;
     }
@@ -1906,6 +1986,7 @@ auto main(int argc, char** argv) -> int {
     return EXIT_FAILURE;
   }
   float timescale, displaytime;
+  double max_duration, start_position;
   ncscale_e scalemode;
   notcurses_options ncopts{};
   ncblitter_e blitter = NCBLIT_DEFAULT;
@@ -1917,12 +1998,12 @@ auto main(int argc, char** argv) -> int {
   int initial_volume = 100;
   auto nonopt = handle_opts(argc, argv, ncopts, &quiet, &timescale, &scalemode,
                             &blitter, &displaytime, &loop, &noninterp, &transcolor,
-                            &climode, &initial_volume);
+                            &climode, &initial_volume, &max_duration, &start_position);
   // if -k was provided, we use CLI mode rather than simply not using the
   // alternate screen, so that output is inline with the shell.
   if(rendered_mode_player(argc - nonopt, argv + nonopt, scalemode, blitter, ncopts,
                           quiet, loop, timescale, displaytime, noninterp,
-                          transcolor, climode, initial_volume)){
+                          transcolor, climode, initial_volume, max_duration, start_position)){
     return EXIT_FAILURE;
   }
   return EXIT_SUCCESS;
