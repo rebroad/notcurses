@@ -296,7 +296,7 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
       // Calculate elapsed video time from start position
       double elapsed_video_seconds = current_video_seconds - marsh->duration_start_seconds;
       if(elapsed_video_seconds >= marsh->max_duration_seconds){
-        loginfo("[duration-limit] video position %.2fs >= start %.2fs + duration %.2fs, exiting", 
+        loginfo("[duration-limit] video position %.2fs >= start %.2fs + duration %.2fs, exiting",
                 current_video_seconds, marsh->duration_start_seconds, marsh->max_duration_seconds);
         marsh->request = PlaybackRequest::Quit;
         return 1; // Signal quit
@@ -1740,16 +1740,16 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
       };
       // Seek to start position if specified (only on first iteration for this file)
       if(start_position >= 0.0 && stream_iteration == 0){
-        logdebug("[start] seeking to initial position %.3fs", start_position);
+        loginfo("[start] seeking to initial position %.3fs", start_position);
         if(ncvisual_seek(*ncv, start_position) == 0){
           double actual_pos = ffmpeg_get_video_position_seconds(*ncv);
-          logdebug("[start] seeked to %.3fs (target was %.3fs)", actual_pos, start_position);
+          loginfo("[start] seeked to %.3fs (target was %.3fs, current was %.3fs)", actual_pos, start_position, current_pos);
           // Update duration start position to the actual seek position
           if(max_duration > 0.0 && std::isfinite(actual_pos) && actual_pos >= 0.0){
             duration_start_seconds = actual_pos;
           }
         }else{
-          logwarn("[start] failed to seek to position %.3fs, starting from beginning", start_position);
+          logwarn("[start] failed to seek to position %.3fs (current was %.3fs), starting from beginning", start_position, current_pos);
         }
       }
 
@@ -2136,7 +2136,7 @@ auto main(int argc, char** argv) -> int {
                             &blitter, &displaytime, &loop, &noninterp, &transcolor,
                             &climode, &initial_volume, &max_duration, &start_position,
                             &output_file, &logfile);
-  
+
   // Redirect stderr to logfile if -f option was provided
   if(logfile != nullptr){
     FILE* log = freopen(logfile, "w", stderr);
@@ -2145,7 +2145,7 @@ auto main(int argc, char** argv) -> int {
       return EXIT_FAILURE;
     }
   }
-  
+
   // Redirect stdout to file if -o option was provided
   if(output_file != nullptr){
     FILE* out = freopen(output_file, "w", stdout);
@@ -2154,7 +2154,7 @@ auto main(int argc, char** argv) -> int {
       return EXIT_FAILURE;
     }
   }
-  
+
   // if -k was provided, we use CLI mode rather than simply not using the
   // alternate screen, so that output is inline with the shell.
   if(rendered_mode_player(argc - nonopt, argv + nonopt, scalemode, blitter, ncopts,
