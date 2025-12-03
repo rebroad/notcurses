@@ -8,7 +8,7 @@ ncplayer - Render images and video to a terminal
 
 # SYNOPSIS
 
-**ncplayer** [**-h**] [**-V**] [**-q**] [**-d** ***delaymult***] [**-l** ***loglevel***] [**-b** ***blitter***] [**-s** ***scalemode***] [**-k**] [**-L**] [**-t** ***seconds***] [**-T** ***seconds***] [**-S** ***seconds***] [**-n**] [**-a** ***color***] files
+**ncplayer** [**-h**] [**-V**] [**-q**] [**-d** ***delaymult***] [**-l** ***loglevel***] [**-b** ***blitter***] [**-s** ***scalemode***] [**-k**] [**-L**] [**-t** ***seconds***] [**-T** ***seconds***] [**-S** ***seconds***] [**-n**] [**-a** ***color***] [**-o** ***file***] files
 
 # DESCRIPTION
 
@@ -57,6 +57,8 @@ be non-negative.
 **-V**: Print the program name and version, and exit with success.
 
 **-h**: Print help information, and exit with success.
+
+**-o** ***file***: Write output to ***file*** instead of stdout. This avoids the need to use shell redirection (e.g., `>`).
 
 files: Select which files to render, and what order to render them in.
 

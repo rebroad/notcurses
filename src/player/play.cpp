@@ -56,7 +56,7 @@ static void usage(std::ostream& os, const char* name, int exitcode)
   __attribute__ ((noreturn));
 
 void usage(std::ostream& o, const char* name, int exitcode){
-  o << "usage: " << name << " [ -h ] [ -q ] [ -m margins ] [ -l loglevel ] [ -d mult ] [ -s scaletype ] [ -k ] [ -L ] [ -t seconds ] [ -T seconds ] [ -S seconds ] [ -n ] [ -a color ] [ -v volume ] files" << '\n';
+  o << "usage: " << name << " [ -h ] [ -q ] [ -m margins ] [ -l loglevel ] [ -d mult ] [ -s scaletype ] [ -k ] [ -L ] [ -t seconds ] [ -T seconds ] [ -S seconds ] [ -n ] [ -a color ] [ -v volume ] [ -o file ] files" << '\n';
   o << " -h: display help and exit with success\n";
   o << " -V: print program name and version\n";
   o << " -q: be quiet (no frame/timing information along top of screen)\n";
@@ -72,7 +72,8 @@ void usage(std::ostream& o, const char* name, int exitcode){
   o << " -a color: replace color with a transparent channel\n";
   o << " -v volume: initial audio volume percentage (0-100, default 100)\n";
   o << " -n: force non-interpolative scaling\n";
-  o << " -d mult: non-negative floating point scale for frame time" << std::endl;
+  o << " -d mult: non-negative floating point scale for frame time\n";
+  o << " -o file: write output to file instead of stdout" << std::endl;
   exit(exitcode);
 }
 
@@ -981,7 +982,7 @@ auto handle_opts(int argc, char** argv, notcurses_options& opts, bool* quiet,
                  float* timescale, ncscale_e* scalemode, ncblitter_e* blitter,
                  float* displaytime, bool* loop, bool* noninterp,
                  uint32_t* transcolor, bool* climode, int* volume_percent,
-                 double* max_duration, double* start_position)
+                 double* max_duration, double* start_position, char** output_file)
                  -> int {
   *timescale = 1.0;
   *scalemode = NCSCALE_STRETCH;
@@ -992,8 +993,9 @@ auto handle_opts(int argc, char** argv, notcurses_options& opts, bool* quiet,
     *volume_percent = std::clamp(*volume_percent, 0, 100);
   }
   bool volume_seen = false;
+  bool output_seen = false;
   int c;
-  while((c = getopt(argc, argv, "Vhql:d:s:b:t:T:S:m:kLa:nv:")) != -1){
+  while((c = getopt(argc, argv, "Vhql:d:s:b:t:T:S:m:kLa:nv:o:")) != -1){
     switch(c){
       case 'h':
         usage(std::cout, argv[0], EXIT_SUCCESS);
@@ -1148,6 +1150,17 @@ auto handle_opts(int argc, char** argv, notcurses_options& opts, bool* quiet,
         }
         *volume_percent = vol;
         volume_seen = true;
+        break;
+      }case 'o':{
+        if(output_file == nullptr){
+          break;
+        }
+        if(output_seen){
+          std::cerr << "Provided -o twice!" << std::endl;
+          usage(std::cerr, argv[0], EXIT_FAILURE);
+        }
+        *output_file = optarg;
+        output_seen = true;
         break;
       }default:
         usage(std::cerr, argv[0], EXIT_FAILURE);
@@ -1996,9 +2009,21 @@ auto main(int argc, char** argv) -> int {
   bool noninterp = false;
   bool climode = false;
   int initial_volume = 100;
+  char* output_file = nullptr;
   auto nonopt = handle_opts(argc, argv, ncopts, &quiet, &timescale, &scalemode,
                             &blitter, &displaytime, &loop, &noninterp, &transcolor,
-                            &climode, &initial_volume, &max_duration, &start_position);
+                            &climode, &initial_volume, &max_duration, &start_position,
+                            &output_file);
+  
+  // Redirect stdout to file if -o option was provided
+  if(output_file != nullptr){
+    FILE* out = freopen(output_file, "w", stdout);
+    if(out == nullptr){
+      std::cerr << "Failed to open output file: " << output_file << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+  
   // if -k was provided, we use CLI mode rather than simply not using the
   // alternate screen, so that output is inline with the shell.
   if(rendered_mode_player(argc - nonopt, argv + nonopt, scalemode, blitter, ncopts,
