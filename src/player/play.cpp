@@ -191,6 +191,8 @@ struct marshal {
   std::atomic<double> longest_audio_duration;
   std::atomic<double> total_audio_duration;
   std::chrono::steady_clock::time_point last_stats_log;
+  bool has_audio_cached; // cached result of ffmpeg_has_audio() to avoid per-frame calls
+  int frames_since_stats_check; // counter to reduce stats check frequency
 };
 
 static constexpr double kNcplayerSeekSeconds = 5.0;
@@ -427,7 +429,9 @@ auto perframe(struct ncvisual* ncv, struct ncvisual_options* vopts,
     }
 
     // Log audio frame statistics periodically (every 5 seconds)
-    if(ffmpeg_has_audio(ncv)){
+    // Only check every 30 frames to reduce overhead (optimization #2)
+    if(marsh->has_audio_cached && (++marsh->frames_since_stats_check >= 30)){
+      marsh->frames_since_stats_check = 0;
       auto now_stats = std::chrono::steady_clock::now();
       auto elapsed_stats = std::chrono::duration_cast<std::chrono::milliseconds>(now_stats - marsh->last_stats_log).count();
       int audio_frame_count = marsh->audio_frame_count_for_stats.load(std::memory_order_relaxed);
@@ -1327,6 +1331,14 @@ static void audio_thread_func(audio_thread_data* data) {
     audio_sample_rate = 44100; // Default fallback
   }
 
+  // Batch updates: only update stats every N frames to reduce atomic contention (optimization #3)
+  const int STATS_UPDATE_INTERVAL = 10; // Update stats every 10 audio frames
+  int frames_since_stats_update = 0;
+  double batch_shortest = std::numeric_limits<double>::max();
+  double batch_longest = 0.0;
+  double batch_total = 0.0;
+  int batch_count = 0;
+
   while(*running){
     bool audio_enabled = ffmpeg_is_audio_enabled(ncv);
     if(!audio_enabled){
@@ -1356,31 +1368,50 @@ static void audio_thread_func(audio_thread_data* data) {
       // Calculate audio frame duration: nb_samples / sample_rate
       double frame_duration = static_cast<double>(samples) / audio_sample_rate;
 
-      // Update marshal stats atomically (main thread will log them)
-      if(data->marsh){
-        // Update count and total (simple atomic operations)
-        data->marsh->audio_frame_count_for_stats.fetch_add(1, std::memory_order_relaxed);
+      // Batch updates: accumulate locally, update atomics less frequently (optimization #3)
+      if(frame_duration < batch_shortest){
+        batch_shortest = frame_duration;
+      }
+      if(frame_duration > batch_longest){
+        batch_longest = frame_duration;
+      }
+      batch_total += frame_duration;
+      batch_count++;
+      frames_since_stats_update++;
+
+      // Update marshal stats atomically every N frames (optimization #3)
+      if(data->marsh && frames_since_stats_update >= STATS_UPDATE_INTERVAL){
+        // Update count (simple atomic increment)
+        data->marsh->audio_frame_count_for_stats.fetch_add(batch_count, std::memory_order_relaxed);
+
+        // Update total (optimized CAS - only retry once, optimization #1)
         double old_total = data->marsh->total_audio_duration.load(std::memory_order_relaxed);
-        double new_total;
-        do {
-          new_total = old_total + frame_duration;
-        } while(!data->marsh->total_audio_duration.compare_exchange_weak(old_total, new_total, std::memory_order_relaxed));
-
-        // Update min (compare-and-swap loop)
-        double old_min = data->marsh->shortest_audio_duration.load(std::memory_order_relaxed);
-        while(frame_duration < old_min){
-          if(data->marsh->shortest_audio_duration.compare_exchange_weak(old_min, frame_duration, std::memory_order_relaxed)){
-            break;
-          }
+        double new_total = old_total + batch_total;
+        if(!data->marsh->total_audio_duration.compare_exchange_weak(old_total, new_total, std::memory_order_relaxed)){
+          // Retry once if CAS failed
+          old_total = data->marsh->total_audio_duration.load(std::memory_order_relaxed);
+          new_total = old_total + batch_total;
+          data->marsh->total_audio_duration.compare_exchange_weak(old_total, new_total, std::memory_order_relaxed);
         }
 
-        // Update max (compare-and-swap loop)
-        double old_max = data->marsh->longest_audio_duration.load(std::memory_order_relaxed);
-        while(frame_duration > old_max){
-          if(data->marsh->longest_audio_duration.compare_exchange_weak(old_max, frame_duration, std::memory_order_relaxed)){
-            break;
-          }
+        // Update min (optimized - try once, accept if we miss an extreme, optimization #1)
+        double current_min = data->marsh->shortest_audio_duration.load(std::memory_order_relaxed);
+        if(batch_shortest < current_min){
+          data->marsh->shortest_audio_duration.compare_exchange_weak(current_min, batch_shortest, std::memory_order_relaxed);
         }
+
+        // Update max (optimized - try once, accept if we miss an extreme, optimization #1)
+        double current_max = data->marsh->longest_audio_duration.load(std::memory_order_relaxed);
+        if(batch_longest > current_max){
+          data->marsh->longest_audio_duration.compare_exchange_weak(current_max, batch_longest, std::memory_order_relaxed);
+        }
+
+        // Reset batch accumulators
+        batch_shortest = std::numeric_limits<double>::max();
+        batch_longest = 0.0;
+        batch_total = 0.0;
+        batch_count = 0;
+        frames_since_stats_update = 0;
       }
       do{
         consecutive_eagain = 0;
@@ -1704,6 +1735,8 @@ int rendered_mode_player_inner(NotCurses& nc, int argc, char** argv,
         .longest_audio_duration = 0.0,
         .total_audio_duration = 0.0,
         .last_stats_log = std::chrono::steady_clock::now(),
+        .has_audio_cached = ffmpeg_has_audio(*ncv),
+        .frames_since_stats_check = 0,
       };
       // Seek to start position if specified (only on first iteration for this file)
       if(start_position >= 0.0 && stream_iteration == 0){
