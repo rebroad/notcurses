@@ -1,2 +1,2 @@
-./ncplayer -S 240 -T 10 ~/Downloads/Back\ To\ The\ Future\ Trilogy\ 1985,1989,1990\ Remastered\ 1080p\ BluRay\ HEVC\ x265\ 5.1\ BONE/Back\ To\ The\ Future\ 1985\ Remastered\ 1080p\ BluRay\ HEVC\ x265\ 5.1\ BONE.mkv
+./ncplayer -S 240 -T 10 -o /tmp/ncplayer-output.txt ~/Downloads/Back\ To\ The\ Future\ Trilogy\ 1985,1989,1990\ Remastered\ 1080p\ BluRay\ HEVC\ x265\ 5.1\ BONE/Back\ To\ The\ Future\ 1985\ Remastered\ 1080p\ BluRay\ HEVC\ x265\ 5.1\ BONE.mkv
 
