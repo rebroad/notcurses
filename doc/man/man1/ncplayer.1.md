@@ -8,7 +8,7 @@ ncplayer - Render images and video to a terminal
 
 # SYNOPSIS
 
-**ncplayer** [**-h**] [**-V**] [**-q**] [**-d** ***delaymult***] [**-l** ***loglevel***] [**-b** ***blitter***] [**-s** ***scalemode***] [**-k**] [**-L**] [**-t** ***seconds***] [**-T** ***seconds***] [**-S** ***seconds***] [**-n**] [**-a** ***color***] [**-o** ***file***] files
+**ncplayer** [**-h**] [**-V**] [**-q**] [**-d** ***delaymult***] [**-l** ***loglevel***] [**-b** ***blitter***] [**-s** ***scalemode***] [**-k**] [**-L**] [**-t** ***seconds***] [**-T** ***seconds***] [**-S** ***seconds***] [**-n**] [**-a** ***color***] [**-o** ***file***] [**-f** ***logfile***] files
 
 # DESCRIPTION
 
@@ -37,6 +37,8 @@ combination with **-T** to play a specific segment of a video. **seconds** must
 be non-negative.
 
 **-l** ***loglevel***: Log between everything (loglevel 7) and nothing (loglevel 0) to stderr.
+
+**-f** ***logfile***: Write log messages to ***logfile*** instead of stderr. This avoids the need to use shell redirection (e.g., `2>`).
 
 **-s** ***scalemode***: Scaling mode, one of **none**, **hires**, **scale**, **scalehi**, or **stretch**.
 

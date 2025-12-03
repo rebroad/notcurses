@@ -56,7 +56,7 @@ static void usage(std::ostream& os, const char* name, int exitcode)
   __attribute__ ((noreturn));
 
 void usage(std::ostream& o, const char* name, int exitcode){
-  o << "usage: " << name << " [ -h ] [ -q ] [ -m margins ] [ -l loglevel ] [ -d mult ] [ -s scaletype ] [ -k ] [ -L ] [ -t seconds ] [ -T seconds ] [ -S seconds ] [ -n ] [ -a color ] [ -v volume ] [ -o file ] files" << '\n';
+  o << "usage: " << name << " [ -h ] [ -q ] [ -m margins ] [ -l loglevel ] [ -d mult ] [ -s scaletype ] [ -k ] [ -L ] [ -t seconds ] [ -T seconds ] [ -S seconds ] [ -n ] [ -a color ] [ -v volume ] [ -o file ] [ -f logfile ] files" << '\n';
   o << " -h: display help and exit with success\n";
   o << " -V: print program name and version\n";
   o << " -q: be quiet (no frame/timing information along top of screen)\n";
@@ -73,7 +73,8 @@ void usage(std::ostream& o, const char* name, int exitcode){
   o << " -v volume: initial audio volume percentage (0-100, default 100)\n";
   o << " -n: force non-interpolative scaling\n";
   o << " -d mult: non-negative floating point scale for frame time\n";
-  o << " -o file: write output to file instead of stdout" << std::endl;
+  o << " -o file: write output to file instead of stdout\n";
+  o << " -f logfile: write log messages to logfile instead of stderr" << std::endl;
   exit(exitcode);
 }
 
@@ -982,7 +983,8 @@ auto handle_opts(int argc, char** argv, notcurses_options& opts, bool* quiet,
                  float* timescale, ncscale_e* scalemode, ncblitter_e* blitter,
                  float* displaytime, bool* loop, bool* noninterp,
                  uint32_t* transcolor, bool* climode, int* volume_percent,
-                 double* max_duration, double* start_position, char** output_file)
+                 double* max_duration, double* start_position, char** output_file,
+                 char** logfile)
                  -> int {
   *timescale = 1.0;
   *scalemode = NCSCALE_STRETCH;
@@ -994,8 +996,9 @@ auto handle_opts(int argc, char** argv, notcurses_options& opts, bool* quiet,
   }
   bool volume_seen = false;
   bool output_seen = false;
+  bool logfile_seen = false;
   int c;
-  while((c = getopt(argc, argv, "Vhql:d:s:b:t:T:S:m:kLa:nv:o:")) != -1){
+  while((c = getopt(argc, argv, "Vhql:d:s:b:t:T:S:m:kLa:nv:o:f:")) != -1){
     switch(c){
       case 'h':
         usage(std::cout, argv[0], EXIT_SUCCESS);
@@ -1161,6 +1164,17 @@ auto handle_opts(int argc, char** argv, notcurses_options& opts, bool* quiet,
         }
         *output_file = optarg;
         output_seen = true;
+        break;
+      }case 'f':{
+        if(logfile == nullptr){
+          break;
+        }
+        if(logfile_seen){
+          std::cerr << "Provided -f twice!" << std::endl;
+          usage(std::cerr, argv[0], EXIT_FAILURE);
+        }
+        *logfile = optarg;
+        logfile_seen = true;
         break;
       }default:
         usage(std::cerr, argv[0], EXIT_FAILURE);
@@ -2010,10 +2024,20 @@ auto main(int argc, char** argv) -> int {
   bool climode = false;
   int initial_volume = 100;
   char* output_file = nullptr;
+  char* logfile = nullptr;
   auto nonopt = handle_opts(argc, argv, ncopts, &quiet, &timescale, &scalemode,
                             &blitter, &displaytime, &loop, &noninterp, &transcolor,
                             &climode, &initial_volume, &max_duration, &start_position,
-                            &output_file);
+                            &output_file, &logfile);
+  
+  // Redirect stderr to logfile if -f option was provided
+  if(logfile != nullptr){
+    FILE* log = freopen(logfile, "w", stderr);
+    if(log == nullptr){
+      std::cerr << "Failed to open logfile: " << logfile << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
   
   // Redirect stdout to file if -o option was provided
   if(output_file != nullptr){
