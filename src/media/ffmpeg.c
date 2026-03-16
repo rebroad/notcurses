@@ -1263,6 +1263,21 @@ ffmpeg_decode_audio_internal(ncvisual* ncv, AVPacket* packet){
 // Returns 0 on success, <0 on error
 // This function is safe to call - it doesn't interfere with video decoding
 static int
+ffmpeg_codec_channels(const AVCodecContext* acodecctx){
+#if LIBAVCODEC_VERSION_MAJOR >= 61
+  return acodecctx->ch_layout.nb_channels;
+#else
+  if(acodecctx->ch_layout.nb_channels > 0){
+    return acodecctx->ch_layout.nb_channels;
+  }
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  return acodecctx->channels;
+  #pragma GCC diagnostic pop
+#endif
+}
+
+static int
 ffmpeg_init_audio_resampler_internal(ncvisual* ncv, int out_sample_rate, int out_channels){
   if(!ncv->details->audiocodecctx || ncv->details->audio_stream_index < 0){
     return -1;
@@ -1280,16 +1295,7 @@ ffmpeg_init_audio_resampler_internal(ncvisual* ncv, int out_sample_rate, int out
   uint64_t out_channel_mask = 0;
 
   // Get input channel count
-  int in_ch_count = 0;
-  if(acodecctx->ch_layout.nb_channels > 0){
-    in_ch_count = acodecctx->ch_layout.nb_channels;
-  }else{
-    // Fallback for older FFmpeg versions
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    in_ch_count = acodecctx->channels;
-    #pragma GCC diagnostic pop
-  }
+  int in_ch_count = ffmpeg_codec_channels(acodecctx);
 
   // Map channel count to standard layout masks
   if(in_ch_count == 1){
@@ -1310,6 +1316,23 @@ ffmpeg_init_audio_resampler_internal(ncvisual* ncv, int out_sample_rate, int out
 
   out_channel_mask = (out_channels == 1) ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
 
+#if LIBSWRESAMPLE_VERSION_MAJOR >= 5 || (LIBSWRESAMPLE_VERSION_MAJOR == 4 && LIBSWRESAMPLE_VERSION_MINOR >= 4)
+  AVChannelLayout in_layout = {0};
+  AVChannelLayout out_layout = {0};
+  if(av_channel_layout_from_mask(&in_layout, in_channel_mask) < 0 ||
+     av_channel_layout_from_mask(&out_layout, out_channel_mask) < 0){
+    return -1;
+  }
+  int sret = swr_alloc_set_opts2(&ncv->details->swrctx,
+                                &out_layout, AV_SAMPLE_FMT_S16, out_sample_rate,
+                                &in_layout, acodecctx->sample_fmt, acodecctx->sample_rate,
+                                0, NULL);
+  av_channel_layout_uninit(&in_layout);
+  av_channel_layout_uninit(&out_layout);
+  if(sret < 0){
+    ncv->details->swrctx = NULL;
+  }
+#else
   #pragma GCC diagnostic push
   #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   ncv->details->swrctx = swr_alloc_set_opts(
@@ -1318,6 +1341,7 @@ ffmpeg_init_audio_resampler_internal(ncvisual* ncv, int out_sample_rate, int out
     in_channel_mask, acodecctx->sample_fmt, acodecctx->sample_rate,
     0, NULL);
   #pragma GCC diagnostic pop
+#endif
 
   if(!ncv->details->swrctx){
     return -1;
@@ -1871,14 +1895,7 @@ ffmpeg_resample_audio(ncvisual* ncv, uint8_t** out_data, int* out_samples){
   int out_channels = ncv->details->audio_out_channels;
   if(out_channels <= 0){
     // Fallback: use input channel count, but limit to 2
-    out_channels = ncv->details->audiocodecctx->ch_layout.nb_channels;
-    if(out_channels == 0){
-      // Fallback for older FFmpeg
-      #pragma GCC diagnostic push
-      #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-      out_channels = ncv->details->audiocodecctx->channels;
-      #pragma GCC diagnostic pop
-    }
+    out_channels = ffmpeg_codec_channels(ncv->details->audiocodecctx);
     // Limit to stereo max
     if(out_channels > 2){
       out_channels = 2;
@@ -1938,14 +1955,7 @@ ffmpeg_get_audio_channels(ncvisual* ncv){
     return 2; // Default stereo
   }
   AVCodecContext* acodecctx = ncv->details->audiocodecctx;
-  int channels = acodecctx->ch_layout.nb_channels;
-  if(channels == 0){
-    // Fallback for older FFmpeg
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    channels = acodecctx->channels;
-    #pragma GCC diagnostic pop
-  }
+  int channels = ffmpeg_codec_channels(acodecctx);
   return channels > 0 ? channels : 2; // Default stereo
 }
 
